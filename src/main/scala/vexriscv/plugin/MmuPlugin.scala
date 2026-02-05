@@ -208,7 +208,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
         // Avoid keeping any invalid line in the cache after an exception.
         // https://github.com/riscv/riscv-linux/blob/8fe28cb58bcb235034b64cbbb7550a8a43fd88be/arch/riscv/include/asm/pgtable.h#L276
         when(service(classOf[IContextSwitching]).isContextSwitching) {
-          for (line <- cache.flatten) {
+          for (set <- cache; line <- set) {
             when(line.exception) {
               line.valid := False
             }
@@ -340,11 +340,11 @@ class MmuPlugin(var ioRange : UInt => Bool,
     fenceStage plug new Area{
       import fenceStage._
       when(arbitration.isValid && arbitration.isFiring && input(IS_SFENCE_VMA2)){
-        for(port <- core.ports; line <- port.cache.flatten) line.valid := False
+        for(port <- core.ports; set <- port.cache; line <- set) line.valid := False
       }
 
       csrService.onWrite(CSR.SATP){
-        for(port <- core.ports; line <- port.cache.flatten) line.valid := False
+        for(port <- core.ports; set <- port.cache; line <- set) line.valid := False
       }
     }
   }
