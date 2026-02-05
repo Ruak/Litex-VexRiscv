@@ -353,6 +353,7 @@ object VexRiscvSmpClusterGen {
           ),
           memoryTranslatorPortConfig = MmuPortConfig(
             portTlbSize = iTlbSize,
+            tlbWayCount = 2,
             latency = 1,
             earlyRequireMmuLockup = true,
             earlyCacheHits = true
@@ -390,6 +391,7 @@ object VexRiscvSmpClusterGen {
           ),
           memoryTranslatorPortConfig = MmuPortConfig(
             portTlbSize = dTlbSize,
+            tlbWayCount = 2,
             latency = 1,
             earlyRequireMmuLockup = true,
             earlyCacheHits = true

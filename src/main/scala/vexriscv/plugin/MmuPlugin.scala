@@ -36,7 +36,25 @@ object MmuPort{
 }
 case class MmuPort(bus : MemoryTranslatorBus, priority : Int, args : MmuPortConfig, id : Int)
 
-case class MmuPortConfig(portTlbSize : Int, latency : Int = 0, earlyRequireMmuLockup : Boolean = false, earlyCacheHits : Boolean = false)
+case class MmuPortConfig(
+  portTlbSize : Int,
+  tlbWayCount : Int = 0,
+  latency : Int = 0,
+  earlyRequireMmuLockup : Boolean = false,
+  earlyCacheHits : Boolean = false
+) {
+  def effectiveWayCount : Int = if(tlbWayCount == 0) portTlbSize else tlbWayCount
+  def setCount : Int = {
+    if(tlbWayCount == 0) {
+      1
+    } else {
+      require(portTlbSize % tlbWayCount == 0, "portTlbSize must be a multiple of tlbWayCount")
+      val sets = portTlbSize / tlbWayCount
+      require(isPow2(sets), "set count must be power of two")
+      sets
+    }
+  }
+}
 
 class MmuPlugin(var ioRange : UInt => Bool,
                 virtualRange : UInt => Bool = address => True,
@@ -50,7 +68,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
 
   override def newTranslationPort(priority : Int,args : Any): MemoryTranslatorBus = {
     val config = args.asInstanceOf[MmuPortConfig]
-    val port = MmuPort(MemoryTranslatorBus(MemoryTranslatorBusParameter(wayCount = config.portTlbSize, latency = config.latency)),priority, config, portsInfo.length)
+    val port = MmuPort(MemoryTranslatorBus(MemoryTranslatorBusParameter(wayCount = config.effectiveWayCount, latency = config.latency)),priority, config, portsInfo.length)
     portsInfo += port
     port.bus
   }
@@ -111,7 +129,10 @@ class MmuPlugin(var ioRange : UInt => Bool,
         val handle = port
         val id = port.id
         val privilegeService = pipeline.serviceElse(classOf[PrivilegeService], PrivilegeServiceDefault())
-        val cache = Vec(Reg(CacheLine()) init, port.args.portTlbSize)
+        val wayCount = port.args.effectiveWayCount
+        val setCount = port.args.setCount
+        val setIndexWidth = log2Up(setCount) max 1
+        val cache = Vec(Vec(Reg(CacheLine()) init, wayCount), setCount)
         val dirty = RegInit(False).allowUnsetRegToAvoidLatch
         if(port.args.earlyRequireMmuLockup){
           dirty clearWhen(!port.bus.cmd.last.isStuck)
@@ -139,15 +160,24 @@ class MmuPlugin(var ioRange : UInt => Bool,
         }
 
         val cacheHitsCmd = port.bus.cmd.takeRight(if(port.args.earlyCacheHits) 2 else 1).head
-        val cacheHitsCalc = B(cache.map(line => line.valid && line.virtualAddress(1) === cacheHitsCmd.virtualAddress(31 downto 22) && (line.superPage || line.virtualAddress(0) === cacheHitsCmd.virtualAddress(21 downto 12))))
+        def setIndexFromVirtual(address : UInt) : UInt = {
+          if(setCount == 1) {
+            U(0, setIndexWidth bits)
+          } else {
+            address(12 + log2Up(setCount) - 1 downto 12)
+          }
+        }
+        val setIndexCalc = setIndexFromVirtual(cacheHitsCmd.virtualAddress)
+        val cacheHitsCalc = B(cache(setIndexCalc).map(line => line.valid && line.virtualAddress(1) === cacheHitsCmd.virtualAddress(31 downto 22) && (line.superPage || line.virtualAddress(0) === cacheHitsCmd.virtualAddress(21 downto 12))))
 
 
         val requireMmuLockup = toRsp(requireMmuLockupCalc, requireMmuLockupCmd)
         val cacheHits = toRsp(cacheHitsCalc, cacheHitsCmd)
+        val setIndex = toRsp(setIndexCalc, cacheHitsCmd)
 
         val cacheHit = cacheHits.asBits.orR
-        val cacheLine = MuxOH(cacheHits, cache)
-        val entryToReplace = Counter(port.args.portTlbSize)
+        val cacheLine = MuxOH(cacheHits, cache(setIndex))
+        val entryToReplace = Vec(Reg(UInt(log2Up(wayCount) bits)) init(0), setCount)
 
 
         when(requireMmuLockup) {
@@ -170,15 +200,15 @@ class MmuPlugin(var ioRange : UInt => Bool,
         port.bus.rsp.isIoAccess := ioRange(port.bus.rsp.physicalAddress)
 
         port.bus.rsp.bypassTranslation := !requireMmuLockup
-        for(wayId <- 0 until port.args.portTlbSize){
+        for(wayId <- 0 until wayCount){
           port.bus.rsp.ways(wayId).sel := cacheHits(wayId)
-          port.bus.rsp.ways(wayId).physical := cache(wayId).physicalAddress(1) @@ (cache(wayId).superPage ? port.bus.cmd.last.virtualAddress(21 downto 12) | cache(wayId).physicalAddress(0)) @@ port.bus.cmd.last.virtualAddress(11 downto 0)
+          port.bus.rsp.ways(wayId).physical := cache(setIndex)(wayId).physicalAddress(1) @@ (cache(setIndex)(wayId).superPage ? port.bus.cmd.last.virtualAddress(21 downto 12) | cache(setIndex)(wayId).physicalAddress(0)) @@ port.bus.cmd.last.virtualAddress(11 downto 0)
         }
 
         // Avoid keeping any invalid line in the cache after an exception.
         // https://github.com/riscv/riscv-linux/blob/8fe28cb58bcb235034b64cbbb7550a8a43fd88be/arch/riscv/include/asm/pgtable.h#L276
         when(service(classOf[IContextSwitching]).isContextSwitching) {
-          for (line <- cache) {
+          for (line <- cache.flatten) {
             when(line.exception) {
               line.valid := False
             }
@@ -279,12 +309,13 @@ class MmuPlugin(var ioRange : UInt => Bool,
         when(dBusRspStaged.valid && !dBusRspStaged.redo && (dBusRsp.leaf || dBusRsp.exception)){
           for((port, id) <- ports.zipWithIndex) {
             when(portSortedOh(id)) {
-              port.entryToReplace.increment()
+              val refillSetIndex = if(port.handle.args.setCount == 1) U(0, (log2Up(port.handle.args.setCount) max 1) bits) else vpn(0)(log2Up(port.handle.args.setCount) - 1 downto 0)
+              port.entryToReplace(refillSetIndex) := port.entryToReplace(refillSetIndex) + 1
               if(port.handle.args.earlyRequireMmuLockup) {
                 port.dirty := True
               } //Avoid having non coherent TLB lookup
-              for ((line, lineId) <- port.cache.zipWithIndex) {
-                when(port.entryToReplace === lineId){
+              for ((line, lineId) <- port.cache(refillSetIndex).zipWithIndex) {
+                when(port.entryToReplace(refillSetIndex) === lineId){
                   val superPage = state === State.L1_RSP
                   line.valid := True
                   line.exception := dBusRsp.exception || (superPage && dBusRsp.pte.PPN0 =/= 0) || !dBusRsp.pte.A
@@ -309,11 +340,11 @@ class MmuPlugin(var ioRange : UInt => Bool,
     fenceStage plug new Area{
       import fenceStage._
       when(arbitration.isValid && arbitration.isFiring && input(IS_SFENCE_VMA2)){
-        for(port <- core.ports; line <- port.cache) line.valid := False
+        for(port <- core.ports; line <- port.cache.flatten) line.valid := False
       }
 
       csrService.onWrite(CSR.SATP){
-        for(port <- core.ports; line <- port.cache) line.valid := False
+        for(port <- core.ports; line <- port.cache.flatten) line.valid := False
       }
     }
   }
