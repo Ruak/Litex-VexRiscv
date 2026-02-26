@@ -129,6 +129,11 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
   var netlistName = "VexRiscvLitexSmpCluster"
   var iTlbSize = 4
   var dTlbSize = 4
+  var tlbPartitioning = true
+  var tlbSecureSetCount = 0
+  var tlbSetsPerSecureDomain = 1
+  var tlbMaxSecureDomains = 0
+  var tlbAllowNonSecureReuse = false
   var wishboneForce32b = false
   var exposeTime = false
   assert(new scopt.OptionParser[Unit]("VexRiscvLitexSmpClusterCmdGen") {
@@ -157,6 +162,11 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
     opt[String]("rvc") action { (v, c) => rvc = v.toBoolean }
     opt[String]("itlb-size") action { (v, c) => iTlbSize = v.toInt }
     opt[String]("dtlb-size") action { (v, c) => dTlbSize = v.toInt }
+    opt[String]("tlb-partitioning") action { (v, c) => tlbPartitioning = v.toBoolean }
+    opt[String]("tlb-secure-set-count") action { (v, c) => tlbSecureSetCount = v.toInt }
+    opt[String]("tlb-sets-per-secure-domain") action { (v, c) => tlbSetsPerSecureDomain = v.toInt }
+    opt[String]("tlb-max-secure-domains") action { (v, c) => tlbMaxSecureDomains = v.toInt }
+    opt[String]("tlb-allow-ns-reuse") action { (v, c) => tlbAllowNonSecureReuse = v.toBoolean }
     opt[String]("expose-time") action { (v, c) => exposeTime = v.toBoolean }
   }.parse(args, Unit).nonEmpty)
 
@@ -185,7 +195,12 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
           rvc = rvc,
           injectorStage = rvc,
           iTlbSize = iTlbSize,
-          dTlbSize = dTlbSize
+          dTlbSize = dTlbSize,
+          tlbPartitioning = tlbPartitioning,
+          tlbSecureSetCount = tlbSecureSetCount,
+          tlbSetsPerSecureDomain = tlbSetsPerSecureDomain,
+          tlbMaxSecureDomains = tlbMaxSecureDomains,
+          tlbAllowNonSecureReuse = tlbAllowNonSecureReuse
         )
         if(aesInstruction) c.add(new AesPlugin)
         c

@@ -41,7 +41,12 @@ case class MmuPortConfig(
   tlbWayCount : Int = 0,
   latency : Int = 0,
   earlyRequireMmuLockup : Boolean = false,
-  earlyCacheHits : Boolean = false
+  earlyCacheHits : Boolean = false,
+  enablePartitioning : Boolean = false,
+  secureSetCount : Int = 0,
+  setsPerSecureDomain : Int = 1,
+  maxSecureDomains : Int = 0,
+  allowNonSecureOnFreeSecureSets : Boolean = false
 ) {
   def effectiveWayCount : Int = if(tlbWayCount == 0) portTlbSize else tlbWayCount
   def setCount : Int = {
@@ -54,6 +59,39 @@ case class MmuPortConfig(
       sets
     }
   }
+
+  def partitionSecureSetCount : Int = {
+    if(!enablePartitioning) {
+      0
+    } else {
+      val candidate = if(secureSetCount == 0) setCount / 2 else secureSetCount
+      require(candidate >= 1 && candidate < setCount, "secureSetCount must be in [1, setCount)")
+      candidate
+    }
+  }
+
+  def partitionNonSecureSetCount : Int = setCount - partitionSecureSetCount
+
+  def partitionSetsPerSecureDomain : Int = {
+    val value = if(setsPerSecureDomain <= 0) 1 else setsPerSecureDomain
+    require(!enablePartitioning || (partitionSecureSetCount % value == 0), "secureSetCount must be a multiple of setsPerSecureDomain")
+    value
+  }
+
+  def partitionDomainCapacity : Int = if(!enablePartitioning) 0 else partitionSecureSetCount / partitionSetsPerSecureDomain
+
+  def partitionMaxSecureDomains : Int = {
+    if(!enablePartitioning) {
+      0
+    } else if(maxSecureDomains == 0) {
+      partitionDomainCapacity
+    } else {
+      require(maxSecureDomains <= partitionDomainCapacity, "maxSecureDomains must be <= partitionDomainCapacity")
+      maxSecureDomains
+    }
+  }
+
+  def partitionSidWidth : Int = log2Up(partitionMaxSecureDomains + 1) max 1
 }
 
 class MmuPlugin(var ioRange : UInt => Bool,
@@ -107,6 +145,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
     }
 
     val csr = pipeline plug new Area{
+      val partitionSidWidth = (sortedPortsInfo.filter(_.args.enablePartitioning).map(_.args.partitionSidWidth) :+ 1).max
       val status = new Area{
         val sum, mxr, mprv = RegInit(False)
         mprv clearWhen(csrService.xretAwayFromMachine)
@@ -119,9 +158,34 @@ class MmuPlugin(var ioRange : UInt => Bool,
           out(mode, asid, ppn)
         }
       }
+      val partition = new Area {
+        val currentSid = Reg(UInt(partitionSidWidth bits)) init(0)
+        val allocSid = Reg(UInt(partitionSidWidth bits)) init(0)
+        val freeSid = Reg(UInt(partitionSidWidth bits)) init(0)
+        val flushSid = Reg(UInt(partitionSidWidth bits)) init(0)
+
+        val allocTrigger = False
+        val freeTrigger = False
+        val flushSidTrigger = False
+        val flushAllTrigger = False
+
+        // status[0] = allocSuccess, status[1] = freeSuccess, status[2] = flushSidSuccess
+        val status = Reg(Bits(32 bits)) init(0)
+      }
 
       for(offset <- List(CSR.MSTATUS, CSR.SSTATUS)) csrService.rw(offset, 19 -> status.mxr, 18 -> status.sum, 17 -> status.mprv)
       csrService.rw(CSR.SATP, 31 -> satp.mode, 22 -> satp.asid, 0 -> satp.ppn)
+      csrService.rw(CSR.TLB_SID, 0 -> partition.currentSid)
+      csrService.rw(CSR.TLB_ALLOC_SID, 0 -> partition.allocSid)
+      csrService.rw(CSR.TLB_FREE_SID, 0 -> partition.freeSid)
+      csrService.rw(CSR.TLB_FLUSH_SID, 0 -> partition.flushSid)
+      csrService.r(CSR.TLB_STATUS, 0 -> partition.status)
+      csrService.onWrite(CSR.TLB_CMD){
+        partition.allocTrigger := csrService.writeData()(0)
+        partition.freeTrigger := csrService.writeData()(1)
+        partition.flushSidTrigger := csrService.writeData()(2)
+        partition.flushAllTrigger := csrService.writeData()(3)
+      }
     }
 
     val core = pipeline plug new Area {
@@ -136,6 +200,62 @@ class MmuPlugin(var ioRange : UInt => Bool,
         val dirty = RegInit(False).allowUnsetRegToAvoidLatch
         if(port.args.earlyRequireMmuLockup){
           dirty clearWhen(!port.bus.cmd.last.isStuck)
+        }
+
+        val partitionEnabled = port.args.enablePartitioning
+        val secureSetCount = port.args.partitionSecureSetCount
+        val nonSecureSetCount = port.args.partitionNonSecureSetCount
+        val secureBaseSet = nonSecureSetCount
+        val setsPerSecureDomain = port.args.partitionSetsPerSecureDomain
+        val maxSecureDomains = port.args.partitionMaxSecureDomains
+        val sidWidth = port.args.partitionSidWidth
+
+        case class PartitionEntry() extends Bundle {
+          val sid = UInt(sidWidth bits)
+          val allocated = Bool
+        }
+        val partitionTable = if(partitionEnabled) Vec(Reg(PartitionEntry()) init(PartitionEntry().getZero), secureSetCount) else null
+
+        def setIndexFromVPage(vPage : UInt, count : Int): UInt = {
+          val width = log2Up(count) max 1
+          if(count == 1) {
+            U(0, width bits)
+          } else if(isPow2(count)) {
+            vPage(log2Up(count) - 1 downto 0)
+          } else {
+            (vPage % U(count, width bits)).resized
+          }
+        }
+
+        def setIndexFromVirtual(address : UInt, count : Int) : UInt = {
+          setIndexFromVPage(address(31 downto 12), count)
+        }
+
+        def secureSetForSid(vPage : UInt, sid : UInt): UInt = {
+          val localIdx = setIndexFromVPage(vPage, setsPerSecureDomain)
+          val sidDomain = sid.resized - U(1, sidWidth bits)
+          val base = U(secureBaseSet, setIndexWidth bits) + (sidDomain.resize(setIndexWidth) * U(setsPerSecureDomain, setIndexWidth bits))
+          (base + localIdx.resize(setIndexWidth)).resized
+        }
+
+        def chooseLookupSet(vAddress : UInt, sid : UInt): UInt = {
+          if(!partitionEnabled) {
+            setIndexFromVirtual(vAddress, setCount).resized
+          } else {
+            val nonSecureSet = setIndexFromVirtual(vAddress, nonSecureSetCount)
+            val secureProbe = U(secureBaseSet, setIndexWidth bits) + setIndexFromVirtual(vAddress, secureSetCount).resized
+            val chosen = UInt(setIndexWidth bits)
+            chosen := nonSecureSet.resized
+            when(sid =/= 0){
+              chosen := secureSetForSid(vAddress(31 downto 12), sid)
+            }
+            if(port.args.allowNonSecureOnFreeSecureSets){
+              when(sid === 0 && !partitionTable(secureProbe - U(secureBaseSet, setIndexWidth bits)).allocated) {
+                chosen := secureProbe
+              }
+            }
+            chosen
+          }
         }
 
         def toRsp[T <: Data](data : T, from : MemoryTranslatorCmd) : T = from match {
@@ -160,14 +280,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
         }
 
         val cacheHitsCmd = port.bus.cmd.takeRight(if(port.args.earlyCacheHits) 2 else 1).head
-        def setIndexFromVirtual(address : UInt) : UInt = {
-          if(setCount == 1) {
-            U(0, setIndexWidth bits)
-          } else {
-            address(12 + log2Up(setCount) - 1 downto 12)
-          }
-        }
-        val setIndexCalc = setIndexFromVirtual(cacheHitsCmd.virtualAddress)
+        val setIndexCalc = chooseLookupSet(cacheHitsCmd.virtualAddress, csr.partition.currentSid.resized)
         val cacheHitsCalc = B(cache(setIndexCalc).map(line => line.valid && line.virtualAddress(1) === cacheHitsCmd.virtualAddress(31 downto 22) && (line.superPage || line.virtualAddress(0) === cacheHitsCmd.virtualAddress(21 downto 12))))
 
 
@@ -178,7 +291,6 @@ class MmuPlugin(var ioRange : UInt => Bool,
         val cacheHit = cacheHits.asBits.orR
         val cacheLine = MuxOH(cacheHits, cache(setIndex))
         val entryToReplace = Vec(Reg(UInt(log2Up(wayCount) bits)) init(0), setCount)
-
 
         when(requireMmuLockup) {
           port.bus.rsp.physicalAddress := cacheLine.physicalAddress(1) @@ (cacheLine.superPage ? port.bus.cmd.last.virtualAddress(21 downto 12) | cacheLine.physicalAddress(0)) @@ port.bus.cmd.last.virtualAddress(11 downto 0)
@@ -205,6 +317,51 @@ class MmuPlugin(var ioRange : UInt => Bool,
           port.bus.rsp.ways(wayId).physical := cache(setIndex)(wayId).physicalAddress(1) @@ (cache(setIndex)(wayId).superPage ? port.bus.cmd.last.virtualAddress(21 downto 12) | cache(setIndex)(wayId).physicalAddress(0)) @@ port.bus.cmd.last.virtualAddress(11 downto 0)
         }
 
+        if(partitionEnabled) {
+          val allocSid = csr.partition.allocSid.resized
+          val freeSid = csr.partition.freeSid.resized
+          val flushSid = csr.partition.flushSid.resized
+
+          when(csr.partition.allocTrigger && (allocSid =/= U(0, sidWidth bits)) && (allocSid <= U(maxSecureDomains, sidWidth bits))){
+            val base = (allocSid - U(1, sidWidth bits)) * U(setsPerSecureDomain, sidWidth bits)
+            for(entryId <- 0 until secureSetCount){
+              val local = U(entryId, sidWidth bits)
+              when(local >= base && local < (base + U(setsPerSecureDomain, sidWidth bits))){
+                partitionTable(entryId).sid := allocSid
+                partitionTable(entryId).allocated := True
+                for(line <- cache(secureBaseSet + entryId)) line.valid := False
+              }
+            }
+            if(id == 0) {
+              csr.partition.status(0) := True
+            }
+          }
+
+          when(csr.partition.freeTrigger && (freeSid =/= U(0, sidWidth bits)) && (freeSid <= U(maxSecureDomains, sidWidth bits))){
+            for(entryId <- 0 until secureSetCount){
+              when(partitionTable(entryId).allocated && partitionTable(entryId).sid === freeSid){
+                partitionTable(entryId).allocated := False
+                partitionTable(entryId).sid := 0
+                for(line <- cache(secureBaseSet + entryId)) line.valid := False
+              }
+            }
+            if(id == 0) {
+              csr.partition.status(1) := True
+            }
+          }
+
+          when(csr.partition.flushSidTrigger){
+            for(entryId <- 0 until secureSetCount){
+              when(partitionTable(entryId).allocated && partitionTable(entryId).sid === flushSid){
+                for(line <- cache(secureBaseSet + entryId)) line.valid := False
+              }
+            }
+            if(id == 0) {
+              csr.partition.status(2) := True
+            }
+          }
+        }
+
         // Avoid keeping any invalid line in the cache after an exception.
         // https://github.com/riscv/riscv-linux/blob/8fe28cb58bcb235034b64cbbb7550a8a43fd88be/arch/riscv/include/asm/pgtable.h#L276
         when(service(classOf[IContextSwitching]).isContextSwitching) {
@@ -222,6 +379,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
         }
         val state = RegInit(State.IDLE)
         val vpn = Reg(Vec(UInt(10 bits), UInt(10 bits)))
+        val refillSid = Reg(UInt(csr.partitionSidWidth bits)) init(0)
         val portSortedOh = Reg(Bits(portsInfo.length bits))
         case class PTE() extends Bundle {
           val V, R, W ,X, U, G, A, D = Bool()
@@ -252,19 +410,12 @@ class MmuPlugin(var ioRange : UInt => Bool,
           is(State.IDLE){
             when(refills.orR){
               portSortedOh := refills
+              refillSid := csr.partition.currentSid
               state := State.L1_CMD
               val address = MuxOH(refills, sortedPortsInfo.map(_.bus.cmd.last.virtualAddress))
               vpn(1) := address(31 downto 22)
               vpn(0) := address(21 downto 12)
             }
-//            for(port <- portsInfo.sortBy(_.priority)){
-//              when(port.bus.cmd.isValid && port.bus.rsp.refilling){
-//                vpn(1) := port.bus.cmd.virtualAddress(31 downto 22)
-//                vpn(0) := port.bus.cmd.virtualAddress(21 downto 12)
-//                portId := port.id
-//                state := State.L1_CMD
-//              }
-//            }
           }
           is(State.L1_CMD){
             dBusAccess.cmd.valid := True
@@ -309,7 +460,29 @@ class MmuPlugin(var ioRange : UInt => Bool,
         when(dBusRspStaged.valid && !dBusRspStaged.redo && (dBusRsp.leaf || dBusRsp.exception)){
           for((port, id) <- ports.zipWithIndex) {
             when(portSortedOh(id)) {
-              val refillSetIndex = if(port.handle.args.setCount == 1) U(0, (log2Up(port.handle.args.setCount) max 1) bits) else vpn(0)(log2Up(port.handle.args.setCount) - 1 downto 0)
+              val refillSetIndex = UInt((log2Up(port.handle.args.setCount) max 1) bits)
+              refillSetIndex := 0
+              if(port.handle.args.enablePartitioning){
+                val sid = refillSid.resized
+                val local = if(port.handle.args.partitionSetsPerSecureDomain == 1) U(0, (log2Up(port.handle.args.partitionSetsPerSecureDomain) max 1) bits) else vpn(0)(log2Up(port.handle.args.partitionSetsPerSecureDomain)-1 downto 0)
+                when(sid === 0){
+                  if(port.handle.args.partitionNonSecureSetCount == 1) {
+                    refillSetIndex := 0
+                  } else {
+                    refillSetIndex := vpn(0)(log2Up(port.handle.args.partitionNonSecureSetCount)-1 downto 0).resized
+                  }
+                } otherwise {
+                  val base = (sid - U(1, sid.getWidth bits)) * U(port.handle.args.partitionSetsPerSecureDomain, sid.getWidth bits)
+                  refillSetIndex := U(port.handle.args.partitionNonSecureSetCount, refillSetIndex.getWidth bits) + (base + local.resized).resized
+                }
+              } else {
+                if(port.handle.args.setCount == 1) {
+                  refillSetIndex := U(0, (log2Up(port.handle.args.setCount) max 1) bits)
+                } else {
+                  refillSetIndex := vpn(0)(log2Up(port.handle.args.setCount) - 1 downto 0).resized
+                }
+              }
+
               port.entryToReplace(refillSetIndex) := port.entryToReplace(refillSetIndex) + 1
               if(port.handle.args.earlyRequireMmuLockup) {
                 port.dirty := True
@@ -344,6 +517,10 @@ class MmuPlugin(var ioRange : UInt => Bool,
       }
 
       csrService.onWrite(CSR.SATP){
+        for(port <- core.ports; set <- port.cache; line <- set) line.valid := False
+      }
+
+      when(csr.partition.flushAllTrigger){
         for(port <- core.ports; set <- port.cache; line <- set) line.valid := False
       }
     }

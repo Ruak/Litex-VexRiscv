@@ -270,7 +270,12 @@ object VexRiscvSmpClusterGen {
                      privilegedDebug: Boolean = false,
                      privilegedDebugTriggers: Int = 2,
                      privilegedDebugTriggersLsu: Boolean = false,
-                     csrFull : Boolean = false
+                     csrFull : Boolean = false,
+                     tlbPartitioning : Boolean = false,
+                     tlbSecureSetCount : Int = 0,
+                     tlbSetsPerSecureDomain : Int = 1,
+                     tlbMaxSecureDomains : Int = 0,
+                     tlbAllowNonSecureReuse : Boolean = false
                     ) = {
     assert(iCacheSize/iCacheWays <= 4096, "Instruction cache ways can't be bigger than 4096 bytes")
     assert(dCacheSize/dCacheWays <= 4096, "Data cache ways can't be bigger than 4096 bytes")
@@ -356,7 +361,12 @@ object VexRiscvSmpClusterGen {
             tlbWayCount = 2,
             latency = 1,
             earlyRequireMmuLockup = true,
-            earlyCacheHits = true
+            earlyCacheHits = true,
+            enablePartitioning = tlbPartitioning,
+            secureSetCount = tlbSecureSetCount,
+            setsPerSecureDomain = tlbSetsPerSecureDomain,
+            maxSecureDomains = tlbMaxSecureDomains,
+            allowNonSecureOnFreeSecureSets = tlbAllowNonSecureReuse
           )
         ) else new IBusSimplePlugin(
           resetVector = resetVector,
@@ -394,7 +404,12 @@ object VexRiscvSmpClusterGen {
             tlbWayCount = 2,
             latency = 1,
             earlyRequireMmuLockup = true,
-            earlyCacheHits = true
+            earlyCacheHits = true,
+            enablePartitioning = tlbPartitioning,
+            secureSetCount = tlbSecureSetCount,
+            setsPerSecureDomain = tlbSetsPerSecureDomain,
+            maxSecureDomains = tlbMaxSecureDomains,
+            allowNonSecureOnFreeSecureSets = tlbAllowNonSecureReuse
           )
         ) else new DBusSimplePlugin(
           catchAddressMisaligned = false,

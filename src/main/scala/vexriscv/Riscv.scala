@@ -252,5 +252,13 @@ object Riscv{
     val TDATA2    = 0x7A2
     val TINFO     = 0x7a4
     val TCONTROL  = 0x7A5
+
+    //Custom MMU/TLB partitioning CSRs (machine RW).
+    val TLB_SID       = 0x5C0
+    val TLB_CMD       = 0x5C1
+    val TLB_ALLOC_SID = 0x5C2
+    val TLB_FREE_SID  = 0x5C3
+    val TLB_FLUSH_SID = 0x5C4
+    val TLB_STATUS    = 0x5C5
   }
 }
