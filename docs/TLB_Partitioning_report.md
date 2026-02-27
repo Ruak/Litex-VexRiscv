@@ -1,6 +1,6 @@
 # VexRiscv TLB Partitioning 改动说明
 
-本文是本仓库中 **TLB Partitioning** 相关改动的统一说明文档，基于当前分支相对于上一次提交的 `git diff`，逐文件、逐区域给出代码差异和行为变化说明。
+本文是仓库中 **TLB Partitioning** 相关改动的统一说明文档，基于当前分支相对于上一次提交的 `git diff`，逐文件、逐区域给出代码差异和行为变化说明。
 
 ---
 
@@ -9,7 +9,7 @@
 本次改动主要涉及四个 Scala 源文件：
 
 - `src/main/scala/vexriscv/Riscv.scala`  
-  定义 RISC-V 指令编码和 CSR 编号。我们在这里增加了一些 **新的 CSR 常量**，专门用于 TLB 分区控制。
+  定义 RISC-V 指令编码和 CSR 编号。在这里增加了一些 **新的 CSR 常量**，专门用于 TLB 分区控制。
 
 - `src/main/scala/vexriscv/plugin/MmuPlugin.scala`  
   MMU/TLB 插件的主体。绝大部分 TLB Partitioning 逻辑都在这里，包括：
@@ -45,7 +45,7 @@ object CSR{
   val TINFO     = 0x7a4
   val TCONTROL  = 0x7A5
 
-  //Custom MMU/TLB partitioning CSRs (machine RW).
+  // TLB partitioning CSRs (machine RW).
   val TLB_SID       = 0x5C0
   val TLB_CMD       = 0x5C1
   val TLB_ALLOC_SID = 0x5C2
@@ -57,7 +57,7 @@ object CSR{
 
 ### 2.2 修改解释
 
-- `object CSR`：就是一个“放常量的地方”，里面每个 `val` 就是一个 CSR 的地址（编号）。
+- `object CSR`：存放常量，每个 `val` 是一个 CSR 的地址（编号）。
 - 新增的 6 个 CSR：
   - `TLB_SID`：当前 **安全域 ID**（SID）。
   - `TLB_CMD`：命令寄存器（哪个 bit 拉高就触发哪个操作）。
@@ -65,6 +65,7 @@ object CSR{
   - `TLB_FREE_SID`：释放哪个 SID。
   - `TLB_FLUSH_SID`：刷哪个 SID 的 TLB。
   - `TLB_STATUS`：命令执行的简单状态标记（哪些操作被接受执行）。
+
 - 这些只是“编号”，真正使用是在 `MmuPlugin` 里，通过 `csrService.rw/r/onWrite` 读写寄存器。
 
 ---
@@ -290,7 +291,7 @@ val core = pipeline plug new Area {
       }
     }
 
-    // ... 后面还有查找/响应/分配等逻辑，下一节继续 ...
+    // ... 后面还有查找/响应/分配等逻辑
   }
 }
 ```
@@ -373,7 +374,7 @@ if(partitionEnabled) {
   - 在 `flushSidTrigger` 有效时，遍历所有 secure set，将 `sid == flushSid` 的 set 内条目清空。
   - 在 `id == 0` 的端口上，将 `status(2)` 置位。
 
-### 6.3 一个重要的 bug 修复
+### 6.3 一个bug 修复
 
 最初实现时，这里的条件写成了：
 
@@ -388,13 +389,13 @@ assign when_MmuPlugin_l325 = (MmuPlugin_partition_allocTrigger && 1'b0) && ...;
 ```
 
 也就是永远为 false。  
-这次我们改成：
+改成：
 
 - 显式写成 `allocSid =/= U(0, sidWidth bits)`，并加括号：
   - `csr.partition.allocTrigger && (allocSid =/= U(...)) && (allocSid <= U(...))`
 
-这样既让类型一致，又避免了 Scala 默认优先级带来的坑。  
-这也是你在网表静态验证中看到 `!= 1'b0` 而不是 `&& 1'b0` 的原因。
+这样既让类型一致，又避免了 Scala 默认优先级问题。  
+这也是在网表静态验证中看到 `!= 1'b0` 而不是 `&& 1'b0` 的原因。
 
 ---
 
@@ -513,13 +514,13 @@ fenceStage plug new Area{
 
 - 做安全域重配置；
 - 做 Debug/测试；
-- 或者在你认为“全刷对性能影响可接受”的场合。
+- 或者在认为“全刷对性能影响可接受”的场合。
 
 ---
 
 ## 9. `VexRiscvSmpCluster.scala`：在配置函数中打开/参数化分区
 
-### 9.1 新的函数签名（只看参数部分）
+### 9.1 新的函数签名
 
 ```scala
 def vexRiscvConfig(hartId : Int,
@@ -649,7 +650,7 @@ def parameter = VexRiscvLitexSmpClusterParameter(
 
 通过命令行参数，可以方便地在 Litex 生成脚本层面配置是否启用 TLB 分区以及分区的具体形态。例如：
 
-- 分区版本：
+- 分区：
 
   ```bash
   --tlb-partitioning=True \
@@ -659,7 +660,7 @@ def parameter = VexRiscvLitexSmpClusterParameter(
   --tlb-allow-ns-reuse=False
   ```
 
-- 基线版本（不启用分区）：
+- 不启用分区：
 
   ```bash
   --tlb-partitioning=False
@@ -684,7 +685,7 @@ def parameter = VexRiscvLitexSmpClusterParameter(
 
 ## 12. sbt 命令与验证步骤
 
-### 12.1 分区版 netlist 生成命令
+### 12.1 分区 netlist 生成命令
 
 （以实际使用的参数为基础，加入分区参数）
 
@@ -720,7 +721,7 @@ sbt "runMain vexriscv.demo.smp.VexRiscvLitexSmpClusterCmdGen \
   --tlb-allow-ns-reuse=False"
 ```
 
-### 12.2 基线版 netlist（不带分区）
+### 12.2 netlist 无分区
 
 只需把 `--tlb-partitioning=True` 改成 `False`，并且可以去掉其他分区参数（因为不会被使用）：
 
