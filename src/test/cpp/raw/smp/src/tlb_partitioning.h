@@ -3,12 +3,13 @@
 
 #include <stdint.h>
 
-#define CSR_TLB_SID       0x5C0
-#define CSR_TLB_CMD       0x5C1
-#define CSR_TLB_ALLOC_SID 0x5C2
-#define CSR_TLB_FREE_SID  0x5C3
-#define CSR_TLB_FLUSH_SID 0x5C4
-#define CSR_TLB_STATUS    0x5C5
+/* Must match Riscv.scala: 0x50x so csr[9:8]=00 => U/S/M can access */
+#define CSR_TLB_SID       0x500
+#define CSR_TLB_CMD       0x501
+#define CSR_TLB_ALLOC_SID 0x502
+#define CSR_TLB_FREE_SID  0x503
+#define CSR_TLB_FLUSH_SID 0x504
+#define CSR_TLB_STATUS    0x505
 
 static inline void csr_write_u32(uint32_t csr, uint32_t value) {
   asm volatile ("csrw %0, %1" :: "i"(csr), "r"(value));

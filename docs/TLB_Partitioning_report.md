@@ -45,13 +45,13 @@ object CSR{
   val TINFO     = 0x7a4
   val TCONTROL  = 0x7A5
 
-  // TLB partitioning CSRs (machine RW).
-  val TLB_SID       = 0x5C0
-  val TLB_CMD       = 0x5C1
-  val TLB_ALLOC_SID = 0x5C2
-  val TLB_FREE_SID  = 0x5C3
-  val TLB_FLUSH_SID = 0x5C4
-  val TLB_STATUS    = 0x5C5
+  // TLB partitioning CSRs
+  val TLB_SID       = 0x500
+  val TLB_CMD       = 0x501
+  val TLB_ALLOC_SID = 0x502
+  val TLB_FREE_SID  = 0x503
+  val TLB_FLUSH_SID = 0x504
+  val TLB_STATUS    = 0x505
 }
 ```
 
@@ -67,6 +67,8 @@ object CSR{
   - `TLB_STATUS`：命令执行的简单状态标记（哪些操作被接受执行）。
 
 - 这些只是“编号”，真正使用是在 `MmuPlugin` 里，通过 `csrService.rw/r/onWrite` 读写寄存器。
+
+- **CSR 权限与地址**：CsrPlugin 用 `privilege < csrAddress(9 downto 8)` 判定非法访问（privilege：User=0，Supervisor=1，Machine=3）。TLB 分区 CSR 使用 **0x500–0x505**（csr[9:8]=00），因此 **U/S/M 均可访问**。若需仅内核可访问，可改为 0x540–0x545（csr[9:8]=01）；仅 M-mode 则为 0x5C0–0x5C5（csr[9:8]=10）。开放给用户后，用户态可读写这些 CSR，生产环境若需隔离可由 OS 在 S-mode 中 trap 并模拟或拒绝。
 
 ---
 

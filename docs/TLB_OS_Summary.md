@@ -72,7 +72,7 @@
 
 ## 4. NS 复用 S Sets 的实现状态
 
-`chooseLookupSet` 里控制复用行为的代码是一个**编译期条件**（Scala `if`，不是 SpinalHDL `when`）：
+`chooseLookupSet` 里控制复用行为的代码是一个**编译期条件**：
 
 ```scala
 if(port.args.allowNonSecureOnFreeSecureSets) {
@@ -175,21 +175,7 @@ OS 动作：
   - set 0（NS 组）不受影响，其中的旧条目安全隔离
 ```
 
-#### 场景 C：安全进程 → NS 进程
-
-```
-OS 动作：
-  1. csrw SATP, next->mm->pgd
-  2. csrw TLB_SID, 0
-
-硬件动作：
-  - currentSid 切换为 0
-  - lookup/refill 只在 set 0（NS 组）中进行
-  - secure set 保留已有条目（下次切回同一安全进程时直接命中）
-  - NS 进程无法访问或驱逐 secure set 的内容
-```
-
-#### 场景 D：安全进程 A → 安全进程 B（不同 SID，当前配置不支持）
+#### 场景 C：安全进程 A → 安全进程 B（不同 SID，当前配置不支持）
 
 > 当前 `maxSecureDomains=1`，只有一个安全 SID，此场景需要将 `maxSecureDomains` 扩展为 ≥2 后才能实现。
 
@@ -207,7 +193,7 @@ OS 动作：
   - 两个 secure 组在 partitionTable 层面严格隔离，互不干扰
 ```
 
-#### 场景 E：安全进程 A → 同 SID=1 的另一安全进程（当前配置下的时间复用）
+#### 场景 D：安全进程 A → 同 SID=1 的另一安全进程（当前配置下的复用）
 
 > 当前只有一个安全 SID，若两个"安全"进程都被分配到 SID=1，它们之间没有 TLB 空间隔离，OS 必须用强制清洗来保证安全。
 
