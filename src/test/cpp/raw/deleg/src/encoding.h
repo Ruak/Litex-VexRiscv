@@ -748,6 +748,16 @@
 #define MASK_CUSTOM3_RD_RS1  0x707f
 #define MATCH_CUSTOM3_RD_RS1_RS2 0x707b
 #define MASK_CUSTOM3_RD_RS1_RS2  0x707f
+
+// VexRiscv custom instruction: user-mode TLB partitioning control (custom-0, funct7 encoded)
+#define MASK_XTLB  0xfe00707f
+#define MATCH_XTLB_GET_SID        0x0000000b
+#define MATCH_XTLB_SET_SID        0x0200000b
+#define MATCH_XTLB_GET_STATUS     0x0400000b
+#define MATCH_XTLB_CMD            0x0600000b
+#define MATCH_XTLB_SET_ALLOC_SID  0x0800000b
+#define MATCH_XTLB_SET_FREE_SID   0x0a00000b
+#define MATCH_XTLB_SET_FLUSH_SID  0x0c00000b
 #define CSR_FFLAGS 0x1
 #define CSR_FRM 0x2
 #define CSR_FCSR 0x3

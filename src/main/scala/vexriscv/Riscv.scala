@@ -110,6 +110,16 @@ object Riscv{
   def CSRRSI             = M"-----------------110-----1110011"
   def CSRRCI             = M"-----------------111-----1110011"
 
+  // Custom-0 opcode (0x0B) used for user-mode TLB partitioning control.
+  // funct7 distinguishes the operation, funct3 is fixed to 000.
+  def XTLB_GET_SID        = M"0000000----------000-----0001011"
+  def XTLB_SET_SID        = M"0000001----------000-----0001011"
+  def XTLB_GET_STATUS     = M"0000010----------000-----0001011"
+  def XTLB_CMD            = M"0000011----------000-----0001011"
+  def XTLB_SET_ALLOC_SID  = M"0000100----------000-----0001011"
+  def XTLB_SET_FREE_SID   = M"0000101----------000-----0001011"
+  def XTLB_SET_FLUSH_SID  = M"0000110----------000-----0001011"
+
   def ECALL              = M"00000000000000000000000001110011"
   def EBREAK             = M"00000000000100000000000001110011"
   def FENCEI             = M"00000000000000000001000000001111"

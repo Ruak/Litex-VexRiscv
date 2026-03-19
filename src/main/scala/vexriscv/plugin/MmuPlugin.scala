@@ -99,16 +99,62 @@ class MmuPlugin(var ioRange : UInt => Bool,
 //                allowUserIo : Boolean = false,
                 enableMmuInMachineMode : Boolean = false,
                 exportSatp: Boolean = false
-                ) extends Plugin[VexRiscv] with MemoryTranslator {
+                ) extends Plugin[VexRiscv] with MemoryTranslator with TlbPartitionInterface {
 
   var dBusAccess : DBusAccess = null
   val portsInfo = ArrayBuffer[MmuPort]()
+
+  // TlbPartitionInterface (created in build when MMU exists)
+  private var partitionSidWidthElab : Int = 1
+  private var currentSidReg, allocSidReg, freeSidReg, flushSidReg : UInt = null
+  private var statusReg : Bits = null
+  private var extSetCurrentSidValid, extSetAllocSidValid, extSetFreeSidValid, extSetFlushSidValid : Bool = null
+  private var extSetCurrentSidValue, extSetAllocSidValue, extSetFreeSidValue, extSetFlushSidValue : UInt = null
+  private var extAllocTrigger, extFreeTrigger, extFlushSidTrigger, extFlushAllTrigger : Bool = null
 
   override def newTranslationPort(priority : Int,args : Any): MemoryTranslatorBus = {
     val config = args.asInstanceOf[MmuPortConfig]
     val port = MmuPort(MemoryTranslatorBus(MemoryTranslatorBusParameter(wayCount = config.effectiveWayCount, latency = config.latency)),priority, config, portsInfo.length)
     portsInfo += port
     port.bus
+  }
+
+  override def sidWidth: Int = partitionSidWidthElab
+  override def currentSid: UInt = currentSidReg
+  override def allocSid: UInt = allocSidReg
+  override def freeSid: UInt = freeSidReg
+  override def flushSid: UInt = flushSidReg
+  override def status: Bits = statusReg
+
+  override def setCurrentSid(value: UInt, enable: Bool): Unit = {
+    when(enable){
+      extSetCurrentSidValid := True
+      extSetCurrentSidValue := value.resized
+    }
+  }
+  override def setAllocSid(value: UInt, enable: Bool): Unit = {
+    when(enable){
+      extSetAllocSidValid := True
+      extSetAllocSidValue := value.resized
+    }
+  }
+  override def setFreeSid(value: UInt, enable: Bool): Unit = {
+    when(enable){
+      extSetFreeSidValid := True
+      extSetFreeSidValue := value.resized
+    }
+  }
+  override def setFlushSid(value: UInt, enable: Bool): Unit = {
+    when(enable){
+      extSetFlushSidValid := True
+      extSetFlushSidValue := value.resized
+    }
+  }
+  override def setTriggers(alloc: Bool, free: Bool, flushSid: Bool, flushAll: Bool): Unit = {
+    extAllocTrigger setWhen(alloc)
+    extFreeTrigger setWhen(free)
+    extFlushSidTrigger setWhen(flushSid)
+    extFlushAllTrigger setWhen(flushAll)
   }
 
   object IS_SFENCE_VMA2 extends Stageable(Bool)
@@ -146,6 +192,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
 
     val csr = pipeline plug new Area{
       val partitionSidWidth = (sortedPortsInfo.filter(_.args.enablePartitioning).map(_.args.partitionSidWidth) :+ 1).max
+      partitionSidWidthElab = partitionSidWidth
       val status = new Area{
         val sum, mxr, mprv = RegInit(False)
         mprv clearWhen(csrService.xretAwayFromMachine)
@@ -164,13 +211,59 @@ class MmuPlugin(var ioRange : UInt => Bool,
         val freeSid = Reg(UInt(partitionSidWidth bits)) init(0)
         val flushSid = Reg(UInt(partitionSidWidth bits)) init(0)
 
-        val allocTrigger = False
-        val freeTrigger = False
-        val flushSidTrigger = False
-        val flushAllTrigger = False
+        val allocTrigger = Bool()
+        val freeTrigger = Bool()
+        val flushSidTrigger = Bool()
+        val flushAllTrigger = Bool()
 
         // status[0] = allocSuccess, status[1] = freeSuccess, status[2] = flushSidSuccess
         val status = Reg(Bits(32 bits)) init(0)
+
+        // External (non-CSR) access path, used by custom instructions.
+        val ext = new Area {
+          val setCurrentSidValid = Bool()
+          val setAllocSidValid = Bool()
+          val setFreeSidValid = Bool()
+          val setFlushSidValid = Bool()
+
+          val setCurrentSidValue = UInt(partitionSidWidth bits)
+          val setAllocSidValue = UInt(partitionSidWidth bits)
+          val setFreeSidValue = UInt(partitionSidWidth bits)
+          val setFlushSidValue = UInt(partitionSidWidth bits)
+          setCurrentSidValue := 0
+          setAllocSidValue := 0
+          setFreeSidValue := 0
+          setFlushSidValue := 0
+
+          val allocTrigger = Bool()
+          val freeTrigger = Bool()
+          val flushSidTrigger = Bool()
+          val flushAllTrigger = Bool()
+        }
+
+        // Defaults (external path is pulse-based)
+        ext.setCurrentSidValid := False
+        ext.setAllocSidValid := False
+        ext.setFreeSidValid := False
+        ext.setFlushSidValid := False
+        ext.allocTrigger := False
+        ext.freeTrigger := False
+        ext.flushSidTrigger := False
+        ext.flushAllTrigger := False
+
+        // Link plugin-level interface wires to this partition block.
+        extSetCurrentSidValid = ext.setCurrentSidValid
+        extSetAllocSidValid = ext.setAllocSidValid
+        extSetFreeSidValid = ext.setFreeSidValid
+        extSetFlushSidValid = ext.setFlushSidValid
+        extSetCurrentSidValue = ext.setCurrentSidValue
+        extSetAllocSidValue = ext.setAllocSidValue
+        extSetFreeSidValue = ext.setFreeSidValue
+        extSetFlushSidValue = ext.setFlushSidValue
+        extAllocTrigger = ext.allocTrigger
+        extFreeTrigger = ext.freeTrigger
+        extFlushSidTrigger = ext.flushSidTrigger
+        extFlushAllTrigger = ext.flushAllTrigger
       }
 
       for(offset <- List(CSR.MSTATUS, CSR.SSTATUS)) csrService.rw(offset, 19 -> status.mxr, 18 -> status.sum, 17 -> status.mprv)
@@ -180,12 +273,37 @@ class MmuPlugin(var ioRange : UInt => Bool,
       csrService.rw(CSR.TLB_FREE_SID, 0 -> partition.freeSid)
       csrService.rw(CSR.TLB_FLUSH_SID, 0 -> partition.flushSid)
       csrService.r(CSR.TLB_STATUS, 0 -> partition.status)
+
+      // CSR command triggers (one-cycle pulses on CSR write)
+      val csrAllocTrigger = False
+      val csrFreeTrigger = False
+      val csrFlushSidTrigger = False
+      val csrFlushAllTrigger = False
       csrService.onWrite(CSR.TLB_CMD){
-        partition.allocTrigger := csrService.writeData()(0)
-        partition.freeTrigger := csrService.writeData()(1)
-        partition.flushSidTrigger := csrService.writeData()(2)
-        partition.flushAllTrigger := csrService.writeData()(3)
+        csrAllocTrigger := csrService.writeData()(0)
+        csrFreeTrigger := csrService.writeData()(1)
+        csrFlushSidTrigger := csrService.writeData()(2)
+        csrFlushAllTrigger := csrService.writeData()(3)
       }
+
+      // Merge CSR and external triggers.
+      partition.allocTrigger := csrAllocTrigger || partition.ext.allocTrigger
+      partition.freeTrigger := csrFreeTrigger || partition.ext.freeTrigger
+      partition.flushSidTrigger := csrFlushSidTrigger || partition.ext.flushSidTrigger
+      partition.flushAllTrigger := csrFlushAllTrigger || partition.ext.flushAllTrigger
+
+      // External writes override the CSR-mapped registers when enabled.
+      when(partition.ext.setCurrentSidValid) { partition.currentSid := partition.ext.setCurrentSidValue }
+      when(partition.ext.setAllocSidValid) { partition.allocSid := partition.ext.setAllocSidValue }
+      when(partition.ext.setFreeSidValid) { partition.freeSid := partition.ext.setFreeSidValue }
+      when(partition.ext.setFlushSidValid) { partition.flushSid := partition.ext.setFlushSidValue }
+
+      // Expose registers through the service interface.
+      currentSidReg = partition.currentSid
+      allocSidReg = partition.allocSid
+      freeSidReg = partition.freeSid
+      flushSidReg = partition.flushSid
+      statusReg = partition.status
     }
 
     val core = pipeline plug new Area {

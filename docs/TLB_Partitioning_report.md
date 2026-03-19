@@ -2,9 +2,166 @@
 
 本文是仓库中 **TLB Partitioning** 相关改动的统一说明文档，基于当前分支相对于上一次提交的 `git diff`，逐文件、逐区域给出代码差异和行为变化说明。
 
+## 0. 防护设计原理
+
+### 0.1 威胁模型：要防什么
+
+这套设计要解决的核心问题，是**共享 TLB 带来的时间侧信道**。
+
+在 LiteX SoC 中，VexRiscv 作为 CPU 核接入系统总线和 DRAM，OS 与用户进程、普通进程与安全敏感进程，都要在同一颗核上复用 MMU/TLB。若 TLB 完全共享，则攻击者可以利用：
+
+- 与受害者访问同一组 set 时的相互驱逐；
+- 访问命中/未命中造成的延迟差异；
+- 上下文切换后残留的 TLB 状态；
+
+去推测受害者的访存行为。这类攻击不要求直接读到受害者的数据，只需要共享微结构状态即可。
+
+当前配置下，I-TLB / D-TLB 都只有 **4 项、2-way、2 sets**。TLB 本身很小，set 冲突更容易发生，因此一旦安全进程和普通进程共用同一组 set，时间差异会更稳定、更容易被观测。
+
+### 0.2 按 set 分区
+
+当前实现选择的是 **set-based partitioning**：
+
+- VexRiscv 的 TLB 在 `MmuPlugin` 里本来就是 `cache(set)(way)` 的组相联结构，查找路径天然先算 `setIndex`，再在该 set 的 ways 中比较命中。
+- 因此，最自然、侵入性最小的改法，就是在 **set 选择阶段**插入 `SID -> set` 的映射逻辑，也就是现在的 `chooseLookupSet(...)` / `secureSetForSid(...)`。
+- 这样做不需要重写整套 TLB 数据结构，也不需要给每个 entry 扩展额外安全元数据；硬件只需为 secure sets 维护一张很小的 `partitionTable`。
+
+
+### 0.3 在 LiteX 生成期固定拓扑、运行期只切 SID
+
+当前设计做了一个明确的分层：
+
+- **生成期（硬件结构）**：
+  - 通过 `VexRiscvSmpCluster.scala` / `VexRiscvSmpLitexCluster.scala` 暴露参数；
+  - 决定 `iTlbSize`、`dTlbSize`、`secureSetCount`、`setsPerSecureDomain`、`maxSecureDomains`、`allowNonSecureOnFreeSecureSets`；
+  - 这些参数会直接影响 TLB 的物理拓扑和综合结果。
+- **运行期（软件策略）**：
+  - 只通过 CSR 告诉硬件当前是谁在运行和哪个 SID 要 alloc/free/flush；
+  - 也就是 `TLB_SID`、`TLB_ALLOC_SID`、`TLB_FREE_SID`、`TLB_FLUSH_SID`、`TLB_CMD` 这一组接口。
+
+这种分层的好处是：
+
+- 硬件负责**强制隔离机制**；
+- OS 负责**把进程/地址空间映射成 SID**。
+
+### 0.4 SID 由软件携带、硬件只执行
+
+从 CPU 视角看，运行时真正知道现在是谁在跑的只有 OS 调度器和地址空间管理代码。
+
+因此当前实现没有让硬件自己分配安全域给进程，而是采用：
+
+- OS 在上下文切换时写 `TLB_SID`；
+- OS 在进程申请/释放安全域时写 `TLB_ALLOC_SID` / `TLB_FREE_SID` 并触发 `TLB_CMD`；
+- 硬件只根据当前 `SID` 做 set 选择、refill 写回和生命周期清洗。
+
+### 0.5 I-TLB 和 D-TLB 分区
+
+在 VexRiscv 的 `MmuPlugin` 中，MMU 端口是按 port 组织的，当前网表中能看到 `ports_0` 和 `ports_1` 两套逻辑，分别对应指令侧和数据侧翻译路径。攻击者既可以从 load/store 侧制造冲突，也可以从取指侧观测命中行为。
+
+因此当前实现是：
+
+- 对每个 MMU port 都维护自己的 `partitionTable`；
+- alloc/free/flushSid 会在每个 port 上同步清洗相应 secure set；
+- `TLB_SID` 影响每个 port 的 set 选择与 refill 落点。
+
+这样才能保证**指令访问和数据访问都遵守同一套域隔离规则**，避免只保护一侧、另一侧继续泄漏。
+
+### 0.6 在 refill 路径锁存 `refillSid`
+
+TLB refill 不是单拍完成的。VexRiscv 的页表遍历与 TLB 写回经过共享状态机，多拍之后才真正把新条目写入 TLB。如果这期间发生上下文切换，而软件又把 `TLB_SID` 改成了另一个值，那么：
+
+如果写回时直接使用当前的 `currentSid`，旧上下文发起的 miss 结果就可能被写入**新上下文的域**；
+
+这会直接破坏隔离。
+
+因此当前实现特地在 refill 请求发起时锁存一个 `refillSid`，后续真正写入 TLB 时只使用这个锁存值，而不是重新读取 `currentSid`。这保证了：
+
+- miss 属于哪个 SID；
+- refill 最终就写回哪个 SID 对应的 set；
+- 即使中途调度切换，也不会把旧域的状态污染到新域。
+
+
+### 0.7 alloc/free/flush 时清空对应 set
+
+当前设计默认 secure sets 可以被不同 SID 在时间上复用，因此释放后重用本身就是一个安全边界。
+
+如果 alloc/free/flush 不主动把对应 set 的 `valid` 清零，会有两个直接问题：
+
+- 新域可能命中旧域残留的结果；
+- 攻击者可能通过 flush+reload 一类方法观察前一个域留下的微结构痕迹。
+
+因此当前实现中：
+
+- `alloc(sid)`：把该 SID 对应 secure set 先清空再启用；
+- `free(sid)`：释放前清空；
+- `flushSid(sid)`：按需只清这个 SID 的 secure set；
+- `flushAll`：提供一个更直接的全局清理手段。
+
+
+### 0.8 当前参数下，这套防护实际提供了什么
+
+结合当前 LiteX 生成参数，当前 netlist 的安全语义其实非常具体：
+
+- I-TLB / D-TLB 都是 **2 sets × 2 ways**；
+- 其中 **1 个 set 给 NS，1 个 set 给 secure**；
+- `SID=0` 使用 NS set；
+- `SID=1` 使用唯一的 secure set；
+- `allowNonSecureOnFreeSecureSets = false`，因此当前 bitstream 中 **NS 不会复用空闲 secure set**。
+
+所以，这个版本真正实现的是：
+
+- **普通域（NS）与唯一安全域（SID=1）之间的 set 级隔离**；
+- 而不是“多个安全进程彼此并行隔离”。
+
+如果未来把 `maxSecureDomains` 提高到大于 1，那么当前这套机制可以自然扩展到多个 secure domains。
+
 ---
 
 ## 1. 总览：哪些文件被改动了？
+
+###  从 LiteX 到 RTL 的生效路径
+
+从 LiteX 生成 SoC 的视角看：
+
+1. LiteX 侧需要一个 **CPU netlist**，并把 CPU 相关参数传给 VexRiscv 的生成入口。
+2. 在本仓库中，这个生成入口就是 `vexriscv.demo.smp.VexRiscvLitexSmpClusterCmdGen`，定义在 `src/main/scala/vexriscv/demo/smp/VexRiscvSmpLitexCluster.scala`。
+3. 该入口通过 `scopt.OptionParser` 接收诸如：
+   - `--itlb-size`
+   - `--dtlb-size`
+   - `--tlb-partitioning`
+   - `--tlb-secure-set-count`
+   - `--tlb-sets-per-secure-domain`
+   - `--tlb-max-secure-domains`
+   - `--tlb-allow-ns-reuse`
+   这些命令行参数。
+4. 解析后的参数被传入 `vexRiscvConfig(...)`，由它统一构造每个 hart 的 `VexRiscvConfig`。
+5. `vexRiscvConfig(...)` 再把 TLB 分区参数写入 I-TLB / D-TLB 使用的 `MmuPortConfig(...)`。
+6. `MmuPlugin` 在 elaboration / generateVerilog 过程中读取这些配置，决定：
+   - 是否启用分区；
+   - secure / non-secure set 如何划分；
+   - SID 宽度和 secure domain 容量；
+   - 是否综合 NS 复用空闲 secure set 的逻辑；
+   - CSR 接口、partitionTable、lookup / refill / alloc / free / flush 行为。
+7. 最后 `VexRiscvLitexSmpClusterCmdGen` 调用：
+
+```scala
+val genConfig = SpinalConfig(targetDirectory = netlistDirectory, inlineRom = true, withTimescale = true)
+genConfig.generateVerilog(dutGen.setDefinitionName(netlistName))
+```
+
+把最终生成的 Verilog **写到 LiteX 指定的 netlist 目录**。LiteX 后续 SoC 构建时使用的就是这份生成好的 CPU 网表。
+
+```text
+LiteX/外部构建脚本
+  -> sbt runMain vexriscv.demo.smp.VexRiscvLitexSmpClusterCmdGen ...
+  -> OptionParser 解析 TLB 分区参数
+  -> vexRiscvConfig(...)
+  -> MmuPortConfig(...)
+  -> MmuPlugin 生成对应硬件
+  -> SpinalConfig.generateVerilog(...)
+  -> 生成带分区逻辑的 CPU Verilog
+  -> LiteX SoC 把该 Verilog 作为 CPU 核实例化
+```
 
 本次改动主要涉及四个 Scala 源文件：
 
@@ -20,7 +177,7 @@
   - refill 时保持 SID 隔离
 
 - `src/main/scala/vexriscv/demo/smp/VexRiscvSmpCluster.scala`  
-  SMP 集群中 CPU 的配置函数 `vexRiscvConfig(...)`。我们在这里把“是否启用分区、如何分配 secure set”等参数暴露给上层。
+  SMP 集群中 CPU 的配置函数 `vexRiscvConfig(...)`。我们在这里把是否启用分区、如何分配 secure set等参数暴露给上层。
 
 - `src/main/scala/vexriscv/demo/smp/VexRiscvSmpLitexCluster.scala`  
   Litex SoC 的 netlist 生成入口。这里：
@@ -57,7 +214,7 @@ object CSR{
 
 ### 2.2 修改解释
 
-- `object CSR`：存放常量，每个 `val` 是一个 CSR 的地址（编号）。
+- `object CSR`：存放常量，每个 `val` 是一个 CSR 的地址。
 - 新增的 6 个 CSR：
   - `TLB_SID`：当前 **安全域 ID**（SID）。
   - `TLB_CMD`：命令寄存器（哪个 bit 拉高就触发哪个操作）。
@@ -66,9 +223,11 @@ object CSR{
   - `TLB_FLUSH_SID`：刷哪个 SID 的 TLB。
   - `TLB_STATUS`：命令执行的简单状态标记（哪些操作被接受执行）。
 
-- 这些只是“编号”，真正使用是在 `MmuPlugin` 里，通过 `csrService.rw/r/onWrite` 读写寄存器。
+- 这些只是编号，真正使用是在 `MmuPlugin` 里，通过 `csrService.rw/r/onWrite` 读写寄存器。
 
-- **CSR 权限与地址**：CsrPlugin 用 `privilege < csrAddress(9 downto 8)` 判定非法访问（privilege：User=0，Supervisor=1，Machine=3）。TLB 分区 CSR 使用 **0x500–0x505**（csr[9:8]=00），因此 **U/S/M 均可访问**。若需仅内核可访问，可改为 0x540–0x545（csr[9:8]=01）；仅 M-mode 则为 0x5C0–0x5C5（csr[9:8]=10）。开放给用户后，用户态可读写这些 CSR，生产环境若需隔离可由 OS 在 S-mode 中 trap 并模拟或拒绝。
+- **CSR 权限与地址**：CsrPlugin 用 `privilege < csrAddress(9 downto 8)` 判定非法访问（privilege：User=0，Supervisor=1，Machine=3）。TLB 分区 CSR 使用 **0x500–0x505**（csr[9:8]=00），因此 **U/S/M 均可访问**。
+
+若需仅内核可访问，可改为 0x540–0x545（csr[9:8]=01）；仅 M-mode 则为 0x5C0–0x5C5（csr[9:8]=10）。
 
 ---
 
@@ -397,7 +556,6 @@ assign when_MmuPlugin_l325 = (MmuPlugin_partition_allocTrigger && 1'b0) && ...;
   - `csr.partition.allocTrigger && (allocSid =/= U(...)) && (allocSid <= U(...))`
 
 这样既让类型一致，又避免了 Scala 默认优先级问题。  
-这也是在网表静态验证中看到 `!= 1'b0` 而不是 `&& 1'b0` 的原因。
 
 ---
 
@@ -468,7 +626,7 @@ val shared = new Area {
 
 ### 7.2 设计意图
 
-TLB refill 由多拍状态机完成，在整个过程中可能发生上下文切换，`TLB_SID` 也可能被软件重写。如果在写回 TLB 时直接使用 `currentSid`，则存在“旧上下文发起的 refill 被写入新上下文域内”的风险。
+TLB refill 由多拍状态机完成，在整个过程中可能发生上下文切换，`TLB_SID` 也可能被软件重写。如果在写回 TLB 时直接使用 `currentSid`，则存在旧上下文发起的 refill 被写入新上下文域内的风险。
 
 为避免该问题，设计采用以下策略：
 
@@ -503,7 +661,7 @@ fenceStage plug new Area{
 
 ### 8.2 行为解释
 
-原来这块只有两种触发“全 TLB 清空”的方式：
+原来这块只有两种触发全 TLB 清空的方式：
 
 - `SFENCE_VMA`（软更新时间映射后，用来让 CPU 丢弃旧 TLB）；
 - 写 `SATP`（切换页表），也会全清空。
@@ -670,24 +828,9 @@ def parameter = VexRiscvLitexSmpClusterParameter(
 
 ---
 
-## 11. Linux 接入
+## 11. sbt 命令与验证步骤
 
-- 在内核维护 `task_struct -> sid` 映射，**不要直接用 PID 当 SID**。
-- 在上下文切换时：
-  - 从任务中取出 `sid`；
-  - 用 `csrw TLB_SID, sid` 设置当前 SID。
-- 在安全域生命周期中：
-  - 新建安全域：调用 `tlb_domain_alloc(sid)`；
-  - 退出时：调用 `tlb_domain_free(sid)`；
-  - 需要清理 TLB 时：调用 `tlb_domain_flush(sid)` 或 `tlb_flush_all()`。
-
-具体的 Linux patch 如何写，取决于目标内核版本和架构目录。
-
----
-
-## 12. sbt 命令与验证步骤
-
-### 12.1 分区 netlist 生成命令
+### 11.1 分区 netlist 生成命令
 
 （以实际使用的参数为基础，加入分区参数）
 
@@ -723,45 +866,12 @@ sbt "runMain vexriscv.demo.smp.VexRiscvLitexSmpClusterCmdGen \
   --tlb-allow-ns-reuse=False"
 ```
 
-### 12.2 netlist 无分区
+### 11.2 netlist 无分区
 
 只需把 `--tlb-partitioning=True` 改成 `False`，并且可以去掉其他分区参数（因为不会被使用）：
 
 ```bash
 --tlb-partitioning=False
 ```
-
-### 12.3 静态验证
-
-在分区版网表上：
-
-- 查 CSR & 分区寄存器：
-
-```bash
-rg "TLB_SID|TLB_CMD|MmuPlugin_partition_" /home/cva6/output/*.v
-```
-
-- 查 set 选择路径与分区表：
-
-```bash
-rg "partitionTable|refillSid|setIndexCalc" /home/cva6/output/*.v
-```
-
-- 检查 alloc/free 条件是否被折叠：
-
-```bash
-rg "when_MmuPlugin_l325|when_MmuPlugin_l340" /home/cva6/output/*.v
-```
-
-确认是 `!= 1'b0` 而不是 `&& 1'b0`。
-
-### 12.4 运行态验证
-
-1. 在内核或裸机中：  
-   - 创建两个任务：SID=0（非安全）和 SID=1（安全域）。  
-   - 通过写 CSR `TLB_SID`、`TLB_ALLOC_SID`、`TLB_CMD` 等接口在 SID=1 上完成安全域分配。
-2. 运行冲突访问测试：  
-   - 让 SID=0 和 SID=1 访问“落在同一原始 set”的虚拟页集合；  
-   - 比较分区开/关时跨域互相驱逐的程度（TLB miss/访问延迟）。
 
 

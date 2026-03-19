@@ -19,6 +19,7 @@ import spinal.lib.misc.plic.PlicMapping
 import spinal.lib.system.debugger.SystemDebuggerConfig
 import vexriscv.ip.{DataCacheAck, DataCacheConfig, DataCacheMemBus, InstructionCache, InstructionCacheConfig}
 import vexriscv.plugin._
+import vexriscv.plugin.TlbCustomInstructionPlugin
 import vexriscv.{Riscv, VexRiscv, VexRiscvBmbGenerator, VexRiscvConfig, plugin}
 
 import scala.collection.mutable
@@ -470,6 +471,8 @@ object VexRiscvSmpClusterGen {
         new YamlPlugin(s"cpu$hartId.yaml")
       )
     )
+
+    if(withMmu && tlbPartitioning) config.plugins += new TlbCustomInstructionPlugin
 
     if(withFloat) config.plugins += new FpuPlugin(
       externalFpu = externalFpu,

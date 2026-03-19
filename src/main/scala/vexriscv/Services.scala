@@ -148,3 +148,26 @@ class CacheReport {
 class DebugReport {
   @BeanProperty var hardwareBreakpointCount = 0
 }
+
+/**
+  * Exposes the MMU/TLB partitioning control plane to other plugins (e.g. custom instructions).
+  *
+  * This is intentionally not a CSR interface: it allows alternative access paths (like custom opcodes)
+  * to drive the same underlying registers/triggers as the CSR-mapped implementation.
+  */
+trait TlbPartitionInterface{
+  def sidWidth : Int
+
+  def currentSid : UInt
+  def allocSid : UInt
+  def freeSid : UInt
+  def flushSid : UInt
+  def status : Bits
+
+  def setCurrentSid(value : UInt, enable : Bool) : Unit
+  def setAllocSid(value : UInt, enable : Bool) : Unit
+  def setFreeSid(value : UInt, enable : Bool) : Unit
+  def setFlushSid(value : UInt, enable : Bool) : Unit
+
+  def setTriggers(alloc : Bool, free : Bool, flushSid : Bool, flushAll : Bool) : Unit
+}
