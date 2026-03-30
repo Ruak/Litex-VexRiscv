@@ -111,6 +111,8 @@ class MmuPlugin(var ioRange : UInt => Bool,
   private var extSetCurrentSidValid, extSetAllocSidValid, extSetFreeSidValid, extSetFlushSidValid : Bool = null
   private var extSetCurrentSidValue, extSetAllocSidValue, extSetFreeSidValue, extSetFlushSidValue : UInt = null
   private var extAllocTrigger, extFreeTrigger, extFlushSidTrigger, extFlushAllTrigger : Bool = null
+  private var extPidSyncReq : Bool = null
+  private var pidSyncBusyWire : Bool = null
 
   override def newTranslationPort(priority : Int,args : Any): MemoryTranslatorBus = {
     val config = args.asInstanceOf[MmuPortConfig]
@@ -156,6 +158,10 @@ class MmuPlugin(var ioRange : UInt => Bool,
     extFlushSidTrigger setWhen(flushSid)
     extFlushAllTrigger setWhen(flushAll)
   }
+  override def requestPidSync(enable: Bool): Unit = {
+    extPidSyncReq setWhen(enable)
+  }
+  override def pidSyncBusy: Bool = pidSyncBusyWire
 
   object IS_SFENCE_VMA2 extends Stageable(Bool)
   override def setup(pipeline: VexRiscv): Unit = {
@@ -177,6 +183,10 @@ class MmuPlugin(var ioRange : UInt => Bool,
 
     //Sorted by priority
     val sortedPortsInfo = portsInfo.sortBy(_.priority)
+
+    // Create the pidSyncBusy signal early so it is never null during elaboration.
+    // It will be driven in the shared MMU state machine.
+    pidSyncBusyWire = Bool()
 
     case class CacheLine() extends Bundle {
       val valid, exception, superPage = Bool
@@ -239,6 +249,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
           val freeTrigger = Bool()
           val flushSidTrigger = Bool()
           val flushAllTrigger = Bool()
+          val pidSyncReq = Bool()
         }
 
         // Defaults (external path is pulse-based)
@@ -250,6 +261,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
         ext.freeTrigger := False
         ext.flushSidTrigger := False
         ext.flushAllTrigger := False
+        ext.pidSyncReq := False
 
         // Link plugin-level interface wires to this partition block.
         extSetCurrentSidValid = ext.setCurrentSidValid
@@ -264,6 +276,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
         extFreeTrigger = ext.freeTrigger
         extFlushSidTrigger = ext.flushSidTrigger
         extFlushAllTrigger = ext.flushAllTrigger
+        extPidSyncReq = ext.pidSyncReq
       }
 
       for(offset <- List(CSR.MSTATUS, CSR.SSTATUS)) csrService.rw(offset, 19 -> status.mxr, 18 -> status.sum, 17 -> status.mprv)
@@ -493,12 +506,14 @@ class MmuPlugin(var ioRange : UInt => Bool,
 
       val shared = new Area {
         val State = new SpinalEnum{
-          val IDLE, L1_CMD, L1_RSP, L0_CMD, L0_RSP = newElement()
+          val IDLE, L1_CMD, L1_RSP, L0_CMD, L0_RSP, PID_CMD, PID_RSP = newElement()
         }
         val state = RegInit(State.IDLE)
+        val pidSyncPending = RegInit(False)
         val vpn = Reg(Vec(UInt(10 bits), UInt(10 bits)))
         val refillSid = Reg(UInt(csr.partitionSidWidth bits)) init(0)
         val portSortedOh = Reg(Bits(portsInfo.length bits))
+        val pidSyncAddress = U(0xF1001000L, 32 bits)
         case class PTE() extends Bundle {
           val V, R, W ,X, U, G, A, D = Bool()
           val RSW = Bits(2 bits)
@@ -524,9 +539,20 @@ class MmuPlugin(var ioRange : UInt => Bool,
         dBusAccess.cmd.writeMask.assignDontCare()
 
         val refills = OHMasking.last(B(ports.map(port => port.handle.bus.cmd.last.isValid && port.requireMmuLockup && !port.dirty && !port.cacheHit)))
+
+        // pidSyncBusy is visible to the custom-instruction plugin and also includes a just-issued request.
+        pidSyncBusyWire := pidSyncPending || state =/= State.IDLE || extPidSyncReq
+
+        // Latch external pid-sync request.
+        when(extPidSyncReq){
+          pidSyncPending := True
+        }
+
         switch(state){
           is(State.IDLE){
-            when(refills.orR){
+            when(pidSyncPending){
+              state := State.PID_CMD
+            } elsewhen(refills.orR){
               portSortedOh := refills
               refillSid := csr.partition.currentSid
               state := State.L1_CMD
@@ -566,6 +592,27 @@ class MmuPlugin(var ioRange : UInt => Bool,
               state := State.IDLE
               when(dBusRspStaged.redo){
                 state := State.L0_CMD
+              }
+            }
+          }
+          is(State.PID_CMD){
+            dBusAccess.cmd.valid := True
+            dBusAccess.cmd.address := pidSyncAddress
+            when(dBusAccess.cmd.ready){
+              state := State.PID_RSP
+            }
+          }
+          is(State.PID_RSP){
+            when(dBusRspStaged.valid){
+              when(dBusRspStaged.redo){
+                state := State.PID_CMD
+              } otherwise {
+                val sid = dBusRspStaged.data(0 downto 0).asUInt.resized
+                csr.partition.currentSid := sid
+                csr.partition.flushSid := sid
+                csr.partition.flushSidTrigger := True
+                pidSyncPending := False
+                state := State.IDLE
               }
             }
           }

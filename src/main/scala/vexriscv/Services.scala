@@ -170,4 +170,8 @@ trait TlbPartitionInterface{
   def setFlushSid(value : UInt, enable : Bool) : Unit
 
   def setTriggers(alloc : Bool, free : Bool, flushSid : Bool, flushAll : Bool) : Unit
+
+  // Trigger hardware-assisted PID sync: read PID from fixed MMIO and apply SID policy.
+  def requestPidSync(enable : Bool) : Unit
+  def pidSyncBusy : Bool
 }

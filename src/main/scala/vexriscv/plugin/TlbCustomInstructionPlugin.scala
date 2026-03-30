@@ -18,7 +18,7 @@ import vexriscv.Riscv._
   */
 class TlbCustomInstructionPlugin extends Plugin[VexRiscv] {
   object XTLB_OP extends SpinalEnum(binarySequential) {
-    val NONE, GET_SID, SET_SID, GET_STATUS, CMD, SET_ALLOC_SID, SET_FREE_SID, SET_FLUSH_SID = newElement()
+    val NONE, GET_SID, SET_SID, GET_STATUS, CMD, SET_ALLOC_SID, SET_FREE_SID, SET_FLUSH_SID, SYNC_PID = newElement()
   }
 
   object XTLB_CTRL extends Stageable(XTLB_OP())
@@ -64,6 +64,10 @@ class TlbCustomInstructionPlugin extends Plugin[VexRiscv] {
       XTLB_CTRL            -> XTLB_OP.SET_FLUSH_SID,
       RS1_USE              -> True
     ))
+    decoder.add(XTLB_SYNC_PID, common ++ List(
+      XTLB_CTRL            -> XTLB_OP.SYNC_PID,
+      HAS_SIDE_EFFECT      -> True
+    ))
   }
 
   override def build(pipeline: VexRiscv): Unit = {
@@ -82,6 +86,7 @@ class TlbCustomInstructionPlugin extends Plugin[VexRiscv] {
       tlb.setFreeSid(rs1, False)
       tlb.setFlushSid(rs1, False)
       tlb.setTriggers(False, False, False, False)
+      tlb.requestPidSync(False)
 
       // Read paths
       when(op === XTLB_OP.GET_SID) {
@@ -112,6 +117,11 @@ class TlbCustomInstructionPlugin extends Plugin[VexRiscv] {
           flushSid = rs1(2),
           flushAll = rs1(3)
         )
+      }
+
+      when(op === XTLB_OP.SYNC_PID && execute.arbitration.isValid){
+        tlb.requestPidSync(True)
+        execute.arbitration.haltItself := tlb.pidSyncBusy
       }
     }
   }
