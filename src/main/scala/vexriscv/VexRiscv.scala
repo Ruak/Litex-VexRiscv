@@ -23,6 +23,8 @@ trait VexRiscvRegressionArg{
 case class VexRiscvConfig(){
   var withMemoryStage = true
   var withWriteBackStage = true
+  /** Set by generators (e.g. vexRiscvConfig) when the CPU exposes `tlbPidLatched`; also inferred from MmuPlugin.tlbPidSyncDedicatedIo. */
+  var withTlbPidLatchedPort = false
   val plugins = ArrayBuffer[Plugin[VexRiscv]]()
 
   def add(that : Plugin[VexRiscv]) : this.type = {plugins += that;this}
@@ -137,6 +139,21 @@ class VexRiscv(val config : VexRiscvConfig) extends Component with Pipeline{
   def stagesFromExecute = stages.dropWhile(_ != execute)
 
   plugins ++= config.plugins
+
+  /** SoC drives current PID for XTLB_SYNC_PID when dedicated IO is enabled; otherwise tied to 0. */
+  val tlbPidLatched: Bits = {
+    val usePort = config.withTlbPidLatchedPort || config.plugins.exists {
+      case m: MmuPlugin => m.tlbPidSyncDedicatedIo
+      case _ => false
+    }
+    if (usePort) {
+      in(Bits(32 bits)).setName("tlb_pid_latched")
+    } else {
+      val tie = Bits(32 bits)
+      tie := B(0, 32 bits)
+      tie
+    }
+  }
 
   //regression usage
   val lastStageInstruction = CombInit(stages.last.input(config.INSTRUCTION)).dontSimplifyIt().addAttribute (Verilator.public)

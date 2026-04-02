@@ -276,7 +276,9 @@ object VexRiscvSmpClusterGen {
                      tlbSecureSetCount : Int = 0,
                      tlbSetsPerSecureDomain : Int = 1,
                      tlbMaxSecureDomains : Int = 0,
-                     tlbAllowNonSecureReuse : Boolean = false
+                     tlbAllowNonSecureReuse : Boolean = false,
+                     /** True: XTLB_SYNC_PID reads dedicated `pid_latched` wired in LiteX generator; false: MMIO read via DBus. */
+                     tlbPidSyncDedicatedIo : Boolean = false
                     ) = {
     assert(iCacheSize/iCacheWays <= 4096, "Instruction cache ways can't be bigger than 4096 bytes")
     assert(dCacheSize/dCacheWays <= 4096, "Data cache ways can't be bigger than 4096 bytes")
@@ -330,7 +332,8 @@ object VexRiscvSmpClusterGen {
     val config = VexRiscvConfig(
       plugins = List(
         if(withMmu)new MmuPlugin(
-          ioRange = ioRange
+          ioRange = ioRange,
+          tlbPidSyncDedicatedIo = tlbPidSyncDedicatedIo
         )else new StaticMemoryTranslatorPlugin(
           ioRange = ioRange
         ),
@@ -479,6 +482,7 @@ object VexRiscvSmpClusterGen {
       simHalt = simHalt,
       p = FpuParameter(withDouble = withDouble)
     )
+    if (withMmu && tlbPidSyncDedicatedIo) config.withTlbPidLatchedPort = true
     config
   }
 

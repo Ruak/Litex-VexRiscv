@@ -1,187 +1,172 @@
-# TLB PID Sync 空指令方案设计
+# TLB PID Sync 空指令 — 设计与当前实现
+
+本文档描述 **`XTLB_SYNC_PID`** 的目标、双路径 PID 来源，以及与仓库中 **当前真实 RTL 实现** 一致的接线方式（含 Spinal 层次约束下的端口设计）。
+
+---
 
 ## 1. 目标
 
-在当前 `TLB 分区 + 自定义指令` 实现基础上，新增一条由 OS 发起的“空指令”：
+在 **TLB 分区 + 自定义指令** 基础上，提供一条由 OS 发起的“空指令”：
 
-- 指令本身不带 SID 参数
-- 硬件收到指令后自动从固定地址 `0xF1001000` 读取 PID（物理 MMIO，不走 MMU）
-- 计算 `SID = PID % 2`（即取 `pid[0]`）
-- 自动执行防护动作：
-  1. 更新 `currentSid`
-  2. 对新 SID 执行 `flushSid`
+- 指令**不显式带 SID**
+- 硬件根据当前 **PID 字（32 bit）** 计算 **`SID = PID % 2`**（实现为 **`pid[0]`**）
+- 自动完成：
+  1. 更新 **`currentSid`**
+  2. 对**新 SID** 执行 **`flushSid`**（非 `flushAll`）
 
-这样 OS 不需要直接拼接多条 `SET_SID/SET_FLUSH_SID/CMD` 指令，只要发一条同步指令即可。
+OS 无需再拼 **`SET_SID` / `SET_FLUSH_SID` / `TLB_CMD`** 等多条指令即可完成一次上下文相关的 TLB 分区同步。
+
+**PID 字来源（二选一，由 `MmuPlugin.tlbPidSyncDedicatedIo` 决定）：**
+
+| 模式 | PID 来源 | 说明 |
+|------|-----------|------|
+| **专用 IO** | SoC 经 **`VexRiscv` 的输入端口 `tlb_pid_latched[31:0]`** 提供 | 不占用 MMU 的 **`DBusAccess`**，避免与页表 refill **互等/死锁**；LiteX CmdGen 在包装顶层用 **`pid_latched`** 驱动各核的 **`vex.tlbPidLatched`** |
+| **DBus MMIO** | **`dBusAccess` 只读物理地址 `0xF1001000`** | 与 **`L1_CMD/L1_RSP/L0_CMD/L0_RSP`** 共用同一 **`shared` 状态机** 与 **`dBusAccess`** |
 
 ---
 
 ## 2. 约束与前提
 
-- PID 读取地址固定：`0xF1001000`
-- 地址类型：**物理 MMIO**（不走 `SATP/MMU` 翻译）
-- SID 规则：`SID = PID % 2`
-- 防护动作：更新 SID 后执行 `flushSid(newSid)`（不是 `flushAll`）
+- **`SID = PID % 2`** → 硬件使用 **`pidWord(0)`**，再 **`resize` 到 `partitionSidWidth`**
+- 防护语义：**更新 SID + `flushSidTrigger` 一拍**（与既有分区 flush 逻辑一致）
+- **MMIO 模式**：`0xF1001000` 为 **物理 MMIO**，不经 MMU 翻译
+- **专用 IO 模式**：在 **`state == IDLE`** 且 **`pidSyncActive`** 时 **组合采样** `pidWord`（与 `tlbPidLatched` 为同一数据路径），**不进入 `PID_CMD/PID_RSP`**
 
 ---
 
-## 3. 架构复用点
+## 3. 架构复用
 
-当前工程已有能力可直接复用：
-
-1. `TlbPartitionInterface`  
-   - 已提供 `setCurrentSid/setFlushSid/setTriggers` 接口
-2. `MmuPlugin.partition.ext` 外部通路  
-   - 已支持非 CSR 通路写寄存器和触发命令（与 CSR 触发 OR 合并）
-3. `DBusAccessService`  
-   - 可用于发起一次 32-bit 读请求（MMIO 读取 PID）
-
-因此无需重做分区逻辑，只需增加“新指令 + 小状态机”。
+- **`TlbPartitionInterface`**：`requestPidSync`、`pidSyncBusy`，及既有 SID/触发合并逻辑
+- **`MmuPlugin.csr.partition`**：`currentSid`、`flushSid`、`flushSidTrigger` 与 TLB 分区表行为不变
+- **`DBusAccessService`**：仅在 **MMIO 模式**下用于读 PID；**LiteX + 分区** 推荐专用 IO
 
 ---
 
-## 4. 指令定义
+## 4. 指令编码
 
-沿用 custom-0：
-
-- `opcode = 0x0B`
-- `funct3 = 000`
-- 新增 `funct7 = 0x07` 作为 `XTLB_SYNC_PID`
-
-在 `Riscv.scala` 中新增：
-
-- `XTLB_SYNC_PID = M"0000111----------000-----0001011"`
+- **`opcode = 0x0B`**（custom-0），**`funct3 = 000`**，**`funct7 = 0x07`**
+- **`Riscv.scala`**：`XTLB_SYNC_PID = M"0000111----------000-----0001011"`
+- C 侧测试头：**`MATCH_XTLB_SYNC_PID`** 等（`encoding.h`）
 
 ---
 
-## 5. 硬件行为流程
+## 5. 硬件行为（状态机与停顿）
 
-## 5.1 流程图
+### 5.1 流程图
 
 ```mermaid
 flowchart TD
-    Start[Decode XTLB_SYNC_PID] --> IssueRead["DBusAccess read 0xF1001000"]
-    IssueRead --> WaitRsp{rsp.valid && !redo}
-    WaitRsp -- No --> Stall[Stall pipeline]
-    Stall --> WaitRsp
-    WaitRsp -- Yes --> CalcSid["sid = rsp.data(0)"]
-    CalcSid --> SetSid["setCurrentSid(sid)"]
-    SetSid --> SetFlushSid["setFlushSid(sid)"]
-    SetFlushSid --> Trigger["setTriggers(flushSid=True)"]
-    Trigger --> Done[Release stall]
+    Dec[Decode XTLB_SYNC_PID] --> Req[extPidSyncRise 置位 pidSyncActive]
+    Req --> Stall[haltItself := pidSyncBusy]
+    Stall --> Mode{tlbPidSyncDedicatedIo ?}
+    Mode -- 是 --> IdleDo[IDLE: 采样 pidWord 来自 tlbPidLatched]
+    IdleDo --> Apply[写 currentSid / flushSid / flushSidTrigger]
+    Mode -- 否 --> PID_CMD[PID_CMD: dBusAccess 读 0xF1001000]
+    PID_CMD --> PID_RSP[PID_RSP 收数]
+    PID_RSP --> Apply
+    Apply --> Clr[pidSyncActive := 0; state := IDLE]
+    Clr --> Done[撤停顿]
 ```
 
-## 5.2 时序语义
+### 5.2 忙信号与上升沿（避免执行级“常拉高请求”卡死）
 
-执行 `XTLB_SYNC_PID` 时：
+- 执行级会反复 **`requestPidSync(True)`**，故 **`extPidSyncReq` 可能多周期为真**。
+- **`extPidSyncRise = extPidSyncReq && !RegNext(extPidSyncReq)`**，仅在上升沿 **`pidSyncActive := True`**。
+- **`pidSyncBusy := pidSyncActive || (state =/= IDLE)`**，**不把 `extPidSyncReq` 直接 OR 进 busy**，否则指令无法退休。
 
-1. 指令进入执行阶段，启动一次 DBus 只读请求到 `0xF1001000`
-2. 在响应返回前，流水线保持停顿（确保“指令语义完成”）
-3. 响应返回后：
-   - `pid := rsp.data`
-   - `sid := pid(0)`
-   - `currentSid := sid`
-   - `flushSid := sid`
-   - 触发 `flushSidTrigger`（一拍）
-4. 指令完成，流水继续
+### 5.3 `IDLE` 分支（与代码一致）
+
+- **`when(pidSyncActive)`** 内用 **Scala 层 `if (tlbPidSyncDedicatedIo)`** 分支（避免 **Scala `Boolean` 与 Spinal `Bool` 混在 `when` 里**）：
+  - **专用 IO**：本周期完成 SID 更新与 **`flushSidTrigger`**，**`pidSyncActive := False`**
+  - **MMIO**：**`state := PID_CMD`**
 
 ---
 
-## 6. 实现方案
+## 6. 当前真实实现（按文件）
 
-本仓库当前实现并未新增独立插件，而是把该能力**集成进现有架构**，以尽量复用已存在的总线访问与分区控制通路：
+### 6.1 `VexRiscv` 端口（层次合法的数据入口）
 
-### 6.1 指令解码与流水停顿：集成在 `TlbCustomInstructionPlugin`
+**文件：** `src/main/scala/vexriscv/VexRiscv.scala`
 
-文件：`src/main/scala/vexriscv/plugin/TlbCustomInstructionPlugin.scala`
+- **`VexRiscvConfig`**：
+  - **`var withTlbPidLatchedPort = false`**：由 **`vexRiscvConfig`** 在 **`withMmu && tlbPidSyncDedicatedIo`** 时置 **`true`**
+  - 另：**`tlbPidLatched` 是否引出** 还兼容 **`plugins` 里存在 `MmuPlugin(tlbPidSyncDedicatedIo=true)`** 的推断（**`withTlbPidLatchedPort || exists(...)`**）
+- **`VexRiscv.tlbPidLatched`**：
+  - 若需要端口：**`in(Bits(32 bits)).setName("tlb_pid_latched")`**
+  - 否则：内部 **`Bits` 恒 0**（未使用专用路径时）
 
-- 新增一个操作枚举：`XTLB_OP.SYNC_PID`
-- `setup()` 中新增解码：
-  - `decoder.add(XTLB_SYNC_PID, ..., XTLB_CTRL -> SYNC_PID, HAS_SIDE_EFFECT -> True)`
-- `build()` 的 Execute 阶段行为：
-  1. 调用 `tlb.requestPidSync(True)` 发起一次 PID 同步请求
-  2. 用 `execute.arbitration.haltItself := tlb.pidSyncBusy` 停住该指令，直到硬件完成读 PID + 更新 SID + flushSid
+综合网表中可搜 **`tlb_pid_latched`** 或等价命名。
 
-这样 OS 侧只发一条 `XTLB_SYNC_PID`，硬件保证“指令退休前语义完成”。
+### 6.2 `MmuPlugin`：别名到 CPU 端口 + `shared` 状态机
 
-### 6.2 PID 读取 + SID/flushSid 更新：集成在 `MmuPlugin`（复用同一个 `dBusAccess`）
+**文件：** `src/main/scala/vexriscv/plugin/MmuPlugin.scala`
 
-文件：`src/main/scala/vexriscv/plugin/MmuPlugin.scala`
+- **构造参数 **`tlbPidSyncDedicatedIo: Boolean = false`****
+- **`build()` 开头**（在 **`shared` Area 之前**）：
+  - 若 **`tlbPidSyncDedicatedIo`**：**`pidSyncDedicatedBits = pipeline.tlbPidLatched`**  
+    → 与 **`VexRiscv`** 的 **`in` 端口为同一信号**，**不在 MMU 内部再 `new Bits` 做跨层次驱动**
+- **`shared`**：
+  - **`pidWord`**：专用 IO 时为 **`pidSyncDedicatedBits`**，否则 **`B(0)`**
+  - **`pidSyncActive` / `extPidSyncRise` / `pidSyncBusyWire`**：见 §5
+  - **MMIO**：**`PID_CMD` / `PID_RSP`** 读 **`0xF1001000`**，写 SID 与 flush
 
-实现复用点：
+### 6.3 `TlbCustomInstructionPlugin`
 
-- `MmuPlugin` 本来就通过 `DBusAccessService.newDBusAccess()` 获得 `dBusAccess`，用于页表 walk / refill
-- 现在新增 PID 同步功能时，**不再新增第二条总线访问口**，而是：
-  - 在 `shared` 状态机中新增 `PID_CMD / PID_RSP`
-  - 与原有 `L1_CMD/L1_RSP/L0_CMD/L0_RSP` 共用同一条 `dBusAccess.cmd` 发起读请求
+**文件：** `src/main/scala/vexriscv/plugin/TlbCustomInstructionPlugin.scala`
 
-状态机要点：
+- **`XTLB_OP.SYNC_PID`**：**`requestPidSync(True)`** + **`haltItself := pidSyncBusy`**
 
-- `pidSyncPending`：外部请求锁存（来自 `TlbPartitionInterface.requestPidSync`）
-- `State.PID_CMD`：发起 `dBusAccess.cmd` 到固定地址 `0xF1001000`
-- `State.PID_RSP`：等待 `dBusAccess.rsp` 返回
-  - `sid := rsp.data(0)`（即 `PID % 2`）
-  - `csr.partition.currentSid := sid`
-  - `csr.partition.flushSid := sid`
-  - `csr.partition.flushSidTrigger := True`（一拍触发）
-  - `pidSyncPending := False`，回到 `IDLE`
+### 6.4 `vexRiscvConfig` 与 LiteX CmdGen
 
-忙信号：
+**文件：** `src/main/scala/vexriscv/demo/smp/VexRiscvSmpCluster.scala`
 
-- `pidSyncBusy := pidSyncPending || state =/= IDLE || extPidSyncReq`
-  - 该 busy 通过 `TlbPartitionInterface.pidSyncBusy` 暴露给 `TlbCustomInstructionPlugin` 用于停顿指令
+- 参数 **`tlbPidSyncDedicatedIo: Boolean = false`** 传入 **`MmuPlugin`**
+- 返回 **`config` 前**：**`if (withMmu && tlbPidSyncDedicatedIo) config.withTlbPidLatchedPort = true`**
+- **`withMmu && tlbPartitioning`** 时追加 **`TlbCustomInstructionPlugin`**
 
-### 6.3 接口层：在 `TlbPartitionInterface` 增加 PID Sync 控制面
+**文件：** `src/main/scala/vexriscv/demo/smp/VexRiscvSmpLitexCluster.scala`
 
-文件：`src/main/scala/vexriscv/Services.scala`
+- **`VexRiscvLitexSmpClusterCmdGen`** 中 **`tlbPidSyncDedicatedIo = tlbPartitioning`**（与自定义指令启用条件对齐）
+- **`dutGen`**：
+  - 包装 **`Component`**：**`val pid_latched = in Bits(32 bits)`**
+  - 对每个 core：**`core.cpu.logic.produce { ... }`** 内  
+    **`vex.tlbPidLatched := pid_latched`**（仅当该核 **`cpuConfigs(i)`** 中 **`MmuPlugin.tlbPidSyncDedicatedIo`** 为真）
 
-新增：
+**层次说明（实现原因）：** Spinal **`PhaseCheckHierarchy`** 不允许用顶层 **`in`** 直接驱动 CPU 深层的 **`MmuPlugin_shared_*` 内部网**。当前做法是让 **PID 经 `VexRiscv` 的 `in` 端口**进入，再由父模块 **`:=`** 连接 **`pid_latched`**，从而通过检查。
 
-- `requestPidSync(enable: Bool)`
-- `pidSyncBusy: Bool`
+### 6.5 `TlbPartitionInterface`
 
-并由 `MmuPlugin` 实现：`requestPidSync` 通过 ext 通路将请求注入到 `MmuPlugin.shared` 状态机。
+**文件：** `src/main/scala/vexriscv/Services.scala`
 
----
-
-## 7. OS 使用方式
-
-OS 在切换到新任务并更新 PID MMIO 后，只发一条：
-
-- `XTLB_SYNC_PID`
-
-硬件自动完成 SID 同步和 flushSid 防护动作。
+- **`requestPidSync` / `pidSyncBusy`**，由 **`MmuPlugin`** 实现。
 
 ---
 
-## 8. 需修改的文件清单
+## 7. OS / SoC 使用要点
 
-1. `src/main/scala/vexriscv/Riscv.scala`  
-   - 新增 `XTLB_SYNC_PID` 编码常量
+- **LiteX + `--tlb-partitioning=True`**：启用专用 IO 时，SoC 需驱动 **包装顶层的 `pid_latched`**（或综合后与 **`tlb_pid_latched`** 相连的 net），再让 OS 在合适时机执行 **`XTLB_SYNC_PID`**。
+- **仅用 MMIO 路径**：配置 **`tlbPidSyncDedicatedIo = false`**，保证 **`0xF1001000`** 可读，再发 **`XTLB_SYNC_PID`**。
 
-2. `src/main/scala/vexriscv/Services.scala`  
-   - 在 `TlbPartitionInterface` 中新增 `requestPidSync/pidSyncBusy`
+---
 
-3. `src/main/scala/vexriscv/plugin/MmuPlugin.scala`  
-   - 在 `shared` 状态机中新增 `PID_CMD/PID_RSP`，复用 `dBusAccess` 读取 `0xF1001000` 并执行 `SID=PID%2 + flushSid`
+## 8. 涉及文件清单
 
-4. `src/main/scala/vexriscv/plugin/TlbCustomInstructionPlugin.scala`  
-   - 新增 `XTLB_SYNC_PID` 解码与执行期 `haltItself` 停顿逻辑
-
-5. `src/test/cpp/regression/encoding.h` 与 `src/test/cpp/raw/deleg/src/encoding.h`  
-   - 新增 `MATCH_XTLB_SYNC_PID` 宏，方便 OS侧调用
+| 文件 | 作用 |
+|------|------|
+| `Riscv.scala` | `XTLB_SYNC_PID` 掩码 |
+| `Services.scala` | `TlbPartitionInterface` |
+| `VexRiscv.scala` | `withTlbPidLatchedPort`、`tlbPidLatched` 端口/ tie-off |
+| `plugin/MmuPlugin.scala` | 双路径、`pidSyncDedicatedBits` 别名、`pidSyncActive`、MMIO FSM |
+| `plugin/TlbCustomInstructionPlugin.scala` | 解码与停顿 |
+| `demo/smp/VexRiscvSmpCluster.scala` | `tlbPidSyncDedicatedIo`、`withTlbPidLatchedPort`、`MmuPlugin`、`TlbCustomInstructionPlugin` |
+| `demo/smp/VexRiscvSmpLitexCluster.scala` | `dutGen`：`pid_latched` → `vex.tlbPidLatched` |
+| `src/test/cpp/.../encoding.h` 等 | `MATCH_XTLB_SYNC_PID` |
 
 ---
 
 ## 9. 注意事项
 
-1. `0xF1001000` 可达性  
-   - 必须保证该 MMIO 地址在当前总线拓扑下可读且及时响应
-
-2. 指令阻塞影响  
-   - 该指令会等待 MMIO 返回，频繁调用会增加调度开销
-
-3. SID 位宽一致性  
-   - 目前策略固定 `PID%2`，即只使用 1 bit SID；若将来扩展多域，需要同步升级映射策略
-
-
-
+1. **DBus 与专用 IO**：高负载下 MMIO 路径可能与 refill 争用 **`dBusAccess`**；生产环境 **LiteX 分区配置** 建议走 **`tlb_pid_latched`**。
+2. **时序**：执行 **`XTLB_SYNC_PID`** 时 **`tlb_pid_latched` / `pid_latched` 应稳定** 为当前任务 PID 字。
+3. **多核**：当前 CmdGen 将 **同一 `pid_latched`** 接到 **各核 `tlbPidLatched`**；若需 per-hart PID，应在 SoC 侧 mux 或扩展生成器。
+4. **SID 策略**：当前固定 **1 bit**；扩展多域需同时改硬件映射与软件约定。

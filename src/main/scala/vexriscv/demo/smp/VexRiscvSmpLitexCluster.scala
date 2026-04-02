@@ -10,7 +10,7 @@ import spinal.lib.sim.SparseMemory
 import vexriscv.demo.smp.VexRiscvLitexSmpClusterCmdGen.exposeTime
 import vexriscv.demo.smp.VexRiscvSmpClusterGen.vexRiscvConfig
 import vexriscv.ip.fpu.{FpuCore, FpuParameter}
-import vexriscv.plugin.{AesPlugin, DBusCachedPlugin, FpuPlugin}
+import vexriscv.plugin.{AesPlugin, DBusCachedPlugin, FpuPlugin, MmuPlugin}
 
 
 case class VexRiscvLitexSmpClusterParameter( cluster : VexRiscvSmpClusterParameter,
@@ -200,7 +200,8 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
           tlbSecureSetCount = tlbSecureSetCount,
           tlbSetsPerSecureDomain = tlbSetsPerSecureDomain,
           tlbMaxSecureDomains = tlbMaxSecureDomains,
-          tlbAllowNonSecureReuse = tlbAllowNonSecureReuse
+          tlbAllowNonSecureReuse = tlbAllowNonSecureReuse,
+          tlbPidSyncDedicatedIo = tlbPartitioning
         )
         if(aesInstruction) c.add(new AesPlugin)
         c
@@ -224,10 +225,24 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
 
   def dutGen = {
     val toplevel = new Component {
+      val pid_latched = in Bits(32 bits)
       val body = new VexRiscvLitexSmpCluster(
         p = parameter
       )
       body.setName("")
+      // Drive VexRiscv's tlbPidLatched input (hierarchy-legal); MmuPlugin aliases that port internally.
+      for ((core, i) <- body.cores.zipWithIndex) {
+        core.cpu.logic.produce {
+          val vex = core.cpu.logic.cpu
+          val need = parameter.cluster.cpuConfigs(i).plugins.exists {
+            case m: MmuPlugin => m.tlbPidSyncDedicatedIo
+            case _ => false
+          }
+          if (need) {
+            vex.tlbPidLatched := pid_latched
+          }
+        }
+      }
     }
     toplevel
   }

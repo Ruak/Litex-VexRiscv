@@ -98,8 +98,13 @@ class MmuPlugin(var ioRange : UInt => Bool,
                 virtualRange : UInt => Bool = address => True,
 //                allowUserIo : Boolean = false,
                 enableMmuInMachineMode : Boolean = false,
-                exportSatp: Boolean = false
+                exportSatp: Boolean = false,
+                /** If true, XTLB_SYNC_PID reads `pidSyncDedicatedBits` (drive from SoC via generator `produce`). If false, uses DBus read to 0xF1001000. */
+                val tlbPidSyncDedicatedIo : Boolean = false
                 ) extends Plugin[VexRiscv] with MemoryTranslator with TlbPartitionInterface {
+
+  /** Combinational PID word from dedicated IO; only instantiated when tlbPidSyncDedicatedIo is true. Connect in cluster `produce`. */
+  var pidSyncDedicatedBits : Bits = null
 
   var dBusAccess : DBusAccess = null
   val portsInfo = ArrayBuffer[MmuPort]()
@@ -187,6 +192,10 @@ class MmuPlugin(var ioRange : UInt => Bool,
     // Create the pidSyncBusy signal early so it is never null during elaboration.
     // It will be driven in the shared MMU state machine.
     pidSyncBusyWire = Bool()
+
+    if (tlbPidSyncDedicatedIo) {
+      pidSyncDedicatedBits = pipeline.tlbPidLatched
+    }
 
     case class CacheLine() extends Bundle {
       val valid, exception, superPage = Bool
@@ -509,11 +518,13 @@ class MmuPlugin(var ioRange : UInt => Bool,
           val IDLE, L1_CMD, L1_RSP, L0_CMD, L0_RSP, PID_CMD, PID_RSP = newElement()
         }
         val state = RegInit(State.IDLE)
-        val pidSyncPending = RegInit(False)
+        /** Holds until PID sync completes (bus or external); latched on rising edge of ext request to avoid busy deadlock. */
+        val pidSyncActive = RegInit(False)
         val vpn = Reg(Vec(UInt(10 bits), UInt(10 bits)))
         val refillSid = Reg(UInt(csr.partitionSidWidth bits)) init(0)
         val portSortedOh = Reg(Bits(portsInfo.length bits))
         val pidSyncAddress = U(0xF1001000L, 32 bits)
+        val pidWord = if(tlbPidSyncDedicatedIo) pidSyncDedicatedBits else B(0, 32 bits)
         case class PTE() extends Bundle {
           val V, R, W ,X, U, G, A, D = Bool()
           val RSW = Bits(2 bits)
@@ -540,18 +551,27 @@ class MmuPlugin(var ioRange : UInt => Bool,
 
         val refills = OHMasking.last(B(ports.map(port => port.handle.bus.cmd.last.isValid && port.requireMmuLockup && !port.dirty && !port.cacheHit)))
 
-        // pidSyncBusy is visible to the custom-instruction plugin and also includes a just-issued request.
-        pidSyncBusyWire := pidSyncPending || state =/= State.IDLE || extPidSyncReq
-
-        // Latch external pid-sync request.
-        when(extPidSyncReq){
-          pidSyncPending := True
+        val extPidSyncPrev = RegNext(extPidSyncReq) init(False)
+        val extPidSyncRise = extPidSyncReq && !extPidSyncPrev
+        when(extPidSyncRise){
+          pidSyncActive := True
         }
+
+        // No/extPidSyncReq here: that would keep pidSyncBusy high forever while the execute stage holds the request.
+        pidSyncBusyWire := pidSyncActive || state =/= State.IDLE
 
         switch(state){
           is(State.IDLE){
-            when(pidSyncPending){
-              state := State.PID_CMD
+            when(pidSyncActive){
+              if(tlbPidSyncDedicatedIo){
+                val sid = pidWord(0 downto 0).asUInt.resize(csr.partitionSidWidth)
+                csr.partition.currentSid := sid
+                csr.partition.flushSid := sid
+                csr.partition.flushSidTrigger := True
+                pidSyncActive := False
+              } else {
+                state := State.PID_CMD
+              }
             } elsewhen(refills.orR){
               portSortedOh := refills
               refillSid := csr.partition.currentSid
@@ -607,11 +627,11 @@ class MmuPlugin(var ioRange : UInt => Bool,
               when(dBusRspStaged.redo){
                 state := State.PID_CMD
               } otherwise {
-                val sid = dBusRspStaged.data(0 downto 0).asUInt.resized
+                val sid = dBusRspStaged.data(0 downto 0).asUInt.resize(csr.partitionSidWidth)
                 csr.partition.currentSid := sid
                 csr.partition.flushSid := sid
                 csr.partition.flushSidTrigger := True
-                pidSyncPending := False
+                pidSyncActive := False
                 state := State.IDLE
               }
             }
