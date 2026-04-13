@@ -225,6 +225,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
         }
       }
       val partition = new Area {
+        val pid = Reg(UInt(32 bits)) init(0)
         val currentSid = Reg(UInt(partitionSidWidth bits)) init(0)
         val allocSid = Reg(UInt(partitionSidWidth bits)) init(0)
         val freeSid = Reg(UInt(partitionSidWidth bits)) init(0)
@@ -295,6 +296,8 @@ class MmuPlugin(var ioRange : UInt => Bool,
       csrService.rw(CSR.TLB_FREE_SID, 0 -> partition.freeSid)
       csrService.rw(CSR.TLB_FLUSH_SID, 0 -> partition.flushSid)
       csrService.r(CSR.TLB_STATUS, 0 -> partition.status)
+
+      csrService.rw(CSR.PID, 0 -> partition.pid)
 
       // CSR command triggers (one-cycle pulses on CSR write)
       val csrAllocTrigger = False
