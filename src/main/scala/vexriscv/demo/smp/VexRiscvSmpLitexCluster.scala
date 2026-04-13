@@ -201,7 +201,8 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
           tlbSetsPerSecureDomain = tlbSetsPerSecureDomain,
           tlbMaxSecureDomains = tlbMaxSecureDomains,
           tlbAllowNonSecureReuse = tlbAllowNonSecureReuse,
-          tlbPidSyncDedicatedIo = tlbPartitioning
+          tlbPidSyncDedicatedIo = tlbPartitioning,
+          csrFull = true
         )
         if(aesInstruction) c.add(new AesPlugin)
         c
@@ -302,7 +303,8 @@ object VexRiscvLitexSmpClusterOpenSbi extends App{
           hartId = hartId,
           ioRange =  address => address(31 downto 28) === 0xF,
           resetVector = 0x40f00000l,
-          rvc = true
+          rvc = true,
+          csrFull = true
         )
       },
       withExclusiveAndInvalidation = true,

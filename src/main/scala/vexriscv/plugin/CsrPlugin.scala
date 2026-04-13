@@ -1850,7 +1850,7 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
           //When no HPM
           if(!csrMapping.mapping.contains(0xB03)){
             val masked = U(csrAddress & 0xF60)
-            when(arbitration.isValid && input(IS_CSR) && U(csrAddress(4 downto 0)) >= 3 && (masked === 0xB00 || masked === 0xC00 && !writeInstruction && privilege === 3 || U(csrAddress & 0xFE0) === 0x320)){
+            when(arbitration.isValid && input(IS_CSR) && U(csrAddress(4 downto 0)) >= 3 && (masked === 0xB00 || masked === 0xC00 && !writeInstruction || U(csrAddress & 0xFE0) === 0x320)){
               csrMapping.allowCsrSignal := True
             }
           }

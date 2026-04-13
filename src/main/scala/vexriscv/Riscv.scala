@@ -272,5 +272,7 @@ object Riscv{
     val TLB_FREE_SID  = 0x503
     val TLB_FLUSH_SID = 0x504
     val TLB_STATUS    = 0x505
+
+    val PID           = 0x800
   }
 }
