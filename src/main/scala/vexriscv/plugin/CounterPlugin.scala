@@ -184,16 +184,8 @@ class CounterPlugin(config : CounterPluginConfig) extends Plugin[VexRiscv] with 
         }
 
         // fixed counters
-        ucycleAccess(csrSrv, prvSrv, UCYCLE,  cycle(31 downto 0),
-          S -> menable(0),
-          U -> (if (prvSrv.hasSupervisor()) senable(0) else True),
-          U -> menable(0)
-        )
-        ucycleAccess(csrSrv, prvSrv, UCYCLEH, cycle(63 downto 32),
-          S -> menable(0),
-          U -> (if (prvSrv.hasSupervisor()) senable(0) else True),
-          U -> menable(0)
-        )
+        ucycleAccess(csrSrv, prvSrv, UCYCLE,  cycle(31 downto 0))
+        ucycleAccess(csrSrv, prvSrv, UCYCLEH, cycle(63 downto 32))
         
         mcycleAccess(csrSrv, prvSrv, MCYCLE,  cycle(31 downto 0),  S -> False, U -> False)
         mcycleAccess(csrSrv, prvSrv, MCYCLEH, cycle(63 downto 32), S -> False, U -> False)
