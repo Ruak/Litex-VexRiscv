@@ -99,7 +99,7 @@ class MmuPlugin(var ioRange : UInt => Bool,
 //                allowUserIo : Boolean = false,
                 enableMmuInMachineMode : Boolean = false,
                 exportSatp: Boolean = false,
-                /** If true, XTLB_SYNC_PID reads `pidSyncDedicatedBits` (drive from SoC via generator `produce`). If false, uses DBus read to 0xF1001000. */
+                /** Legacy switch kept for compatibility. XTLB_SYNC_PID now derives SID from CSR.PID (0x800). */
                 val tlbPidSyncDedicatedIo : Boolean = false
                 ) extends Plugin[VexRiscv] with MemoryTranslator with TlbPartitionInterface {
 
@@ -518,16 +518,15 @@ class MmuPlugin(var ioRange : UInt => Bool,
 
       val shared = new Area {
         val State = new SpinalEnum{
-          val IDLE, L1_CMD, L1_RSP, L0_CMD, L0_RSP, PID_CMD, PID_RSP = newElement()
+          val IDLE, L1_CMD, L1_RSP, L0_CMD, L0_RSP = newElement()
         }
         val state = RegInit(State.IDLE)
-        /** Holds until PID sync completes (bus or external); latched on rising edge of ext request to avoid busy deadlock. */
+        /** Holds until PID sync completes; latched on rising edge of ext request to avoid busy deadlock. */
         val pidSyncActive = RegInit(False)
         val vpn = Reg(Vec(UInt(10 bits), UInt(10 bits)))
         val refillSid = Reg(UInt(csr.partitionSidWidth bits)) init(0)
         val portSortedOh = Reg(Bits(portsInfo.length bits))
-        val pidSyncAddress = U(0xF1001000L, 32 bits)
-        val pidWord = if(tlbPidSyncDedicatedIo) pidSyncDedicatedBits else B(0, 32 bits)
+        val pidWord = csr.partition.pid.asBits
         case class PTE() extends Bundle {
           val V, R, W ,X, U, G, A, D = Bool()
           val RSW = Bits(2 bits)
@@ -566,15 +565,11 @@ class MmuPlugin(var ioRange : UInt => Bool,
         switch(state){
           is(State.IDLE){
             when(pidSyncActive){
-              if(tlbPidSyncDedicatedIo){
-                val sid = pidWord(0 downto 0).asUInt.resize(csr.partitionSidWidth)
-                csr.partition.currentSid := sid
-                csr.partition.flushSid := sid
-                csr.partition.flushSidTrigger := True
-                pidSyncActive := False
-              } else {
-                state := State.PID_CMD
-              }
+              val sid = pidWord(0 downto 0).asUInt.resize(csr.partitionSidWidth)
+              csr.partition.currentSid := sid
+              csr.partition.flushSid := sid
+              csr.partition.flushSidTrigger := True
+              pidSyncActive := False
             } elsewhen(refills.orR){
               portSortedOh := refills
               refillSid := csr.partition.currentSid
@@ -615,27 +610,6 @@ class MmuPlugin(var ioRange : UInt => Bool,
               state := State.IDLE
               when(dBusRspStaged.redo){
                 state := State.L0_CMD
-              }
-            }
-          }
-          is(State.PID_CMD){
-            dBusAccess.cmd.valid := True
-            dBusAccess.cmd.address := pidSyncAddress
-            when(dBusAccess.cmd.ready){
-              state := State.PID_RSP
-            }
-          }
-          is(State.PID_RSP){
-            when(dBusRspStaged.valid){
-              when(dBusRspStaged.redo){
-                state := State.PID_CMD
-              } otherwise {
-                val sid = dBusRspStaged.data(0 downto 0).asUInt.resize(csr.partitionSidWidth)
-                csr.partition.currentSid := sid
-                csr.partition.flushSid := sid
-                csr.partition.flushSidTrigger := True
-                pidSyncActive := False
-                state := State.IDLE
               }
             }
           }
